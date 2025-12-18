@@ -17,10 +17,12 @@ jobs:
         include:
           - platform: windows-latest
             args: ''
+            server_target: node18-win-x64
+            server_output: server-x86_64-pc-windows-msvc.exe
           - platform: macos-latest
             args: '--target universal-apple-darwin'
-          - platform: ubuntu-22.04
-            args: ''
+            server_target: ''
+            server_output: ''
 
     runs-on: ${{ matrix.platform }}
 
@@ -37,11 +39,13 @@ jobs:
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - name: Install dependencies (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
+      - name: Build server binary (Windows)
+        if: matrix.platform == 'windows-latest'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+          npm install -g pkg
+          cd server
+          npm install
+          pkg index.js --target ${{ matrix.server_target }} --output ../src-tauri/bin/${{ matrix.server_output }}
 
       - name: Install frontend dependencies
         run: npm install
