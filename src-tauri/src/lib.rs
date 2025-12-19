@@ -34,17 +34,26 @@ fn capture_screen() -> Result<String, String> {
 #[tauri::command]
 fn start_capture_loop(app: tauri::AppHandle, interval_ms: u64) {
     if CAPTURING.load(Ordering::SeqCst) {
+        println!("Capture already running");
         return;
     }
     CAPTURING.store(true, Ordering::SeqCst);
+    println!("Starting capture loop with interval: {}ms", interval_ms);
 
     std::thread::spawn(move || {
         while CAPTURING.load(Ordering::SeqCst) {
-            if let Ok(data) = capture_screen() {
-                let _ = app.emit("screen-frame", data);
+            match capture_screen() {
+                Ok(data) => {
+                    println!("Captured frame, size: {} bytes", data.len());
+                    let _ = app.emit("screen-frame", data);
+                }
+                Err(e) => {
+                    println!("Capture error: {}", e);
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(interval_ms));
         }
+        println!("Capture loop stopped");
     });
 }
 

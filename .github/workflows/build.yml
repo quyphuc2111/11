@@ -11,21 +11,7 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: windows-latest
-            args: ''
-            server_target: node18-win-x64
-            server_output: server-x86_64-pc-windows-msvc.exe
-          - platform: macos-latest
-            args: '--target universal-apple-darwin'
-            server_target: node18-macos-x64,node18-macos-arm64
-            server_output_x64: server-x86_64-apple-darwin
-            server_output_arm: server-aarch64-apple-darwin
-
-    runs-on: ${{ matrix.platform }}
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -37,25 +23,13 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - name: Build server binary (Windows)
-        if: matrix.platform == 'windows-latest'
+      - name: Build server binary
         run: |
           npm install -g pkg
           cd server
           npm install
-          pkg index.js --target ${{ matrix.server_target }} --output ../src-tauri/bin/${{ matrix.server_output }}
-
-      - name: Build server binary (macOS)
-        if: matrix.platform == 'macos-latest'
-        run: |
-          npm install -g pkg
-          cd server
-          npm install
-          pkg index.js --target node18-macos-x64 --output ../src-tauri/bin/${{ matrix.server_output_x64 }}
-          pkg index.js --target node18-macos-arm64 --output ../src-tauri/bin/${{ matrix.server_output_arm }}
+          pkg index.js --target node18-win-x64 --output ../src-tauri/bin/server-x86_64-pc-windows-msvc.exe
 
       - name: Install frontend dependencies
         run: npm install
@@ -70,4 +44,3 @@ jobs:
           releaseBody: 'Download the installer for your platform below.'
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}

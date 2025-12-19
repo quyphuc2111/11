@@ -75,7 +75,12 @@ function App() {
   // Socket connection
   useEffect(() => {
     if (!isLoggedIn || !role) return;
-    const targetUrl = `http://${serverIp}:3001`;
+    // Admin kết nối localhost vì server chạy trên máy admin
+    // Client kết nối đến IP của máy admin
+    const targetUrl = role === "admin" 
+      ? "http://localhost:3001" 
+      : `http://${serverIp}:3001`;
+    console.log("Connecting to:", targetUrl);
     const newSocket = io(targetUrl, { autoConnect: false });
     setSocket(newSocket);
     return () => {
@@ -83,41 +88,78 @@ function App() {
     };
   }, [serverIp, isLoggedIn, role]);
 
-  // Client: Start native screen capture
+  // Client: Start screen capture
   useEffect(() => {
     if (!isLoggedIn || role !== "client" || !socket) return;
-    if (!isTauri) return;
 
     let cleanup: (() => void) | null = null;
+    let captureStarted = false;
 
     const startCapture = async () => {
+      if (captureStarted) return;
+      captureStarted = true;
+
+      console.log("Starting capture... isTauri:", isTauri);
+
+      if (isTauri) {
+        // Thử Rust capture trước
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          const { listen } = await import("@tauri-apps/api/event");
+
+          const unlisten = await listen<string>("screen-frame", (event) => {
+            console.log("Got frame from Rust");
+            socket?.emit("screen-frame", event.payload);
+          });
+
+          await invoke("start_capture_loop", { intervalMs: 500 });
+          setStatus("Đang chia sẻ màn hình (Native)");
+
+          cleanup = () => {
+            unlisten();
+            invoke("stop_capture_loop");
+          };
+          return;
+        } catch (e) {
+          console.error("Rust capture failed, trying browser API:", e);
+        }
+      }
+
+      // Fallback: Browser getDisplayMedia (cần user click)
       try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        const { listen } = await import("@tauri-apps/api/event");
+        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        const video = document.createElement("video");
+        video.srcObject = stream;
+        video.play();
 
-        // Listen for screen frames from Rust
-        const unlisten = await listen<string>("screen-frame", (event) => {
-          socket?.emit("screen-frame", event.payload);
-        });
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d")!;
 
-        // Start capture loop (500ms interval = ~2 FPS)
-        await invoke("start_capture_loop", { intervalMs: 500 });
-        setStatus("Đang chia sẻ màn hình");
+        const captureFrame = () => {
+          if (!stream.active) return;
+          canvas.width = 800;
+          canvas.height = (800 * video.videoHeight) / video.videoWidth;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const data = canvas.toDataURL("image/jpeg", 0.6);
+          socket?.emit("screen-frame", data);
+        };
+
+        const interval = setInterval(captureFrame, 500);
+        setStatus("Đang chia sẻ màn hình (Browser)");
 
         cleanup = () => {
-          unlisten();
-          invoke("stop_capture_loop");
+          clearInterval(interval);
+          stream.getTracks().forEach((t) => t.stop());
         };
-      } catch (e) {
-        console.error("Failed to start capture:", e);
-        setStatus("Lỗi capture màn hình");
+      } catch (e: any) {
+        console.error("Browser capture failed:", e);
+        setStatus(`Lỗi: ${e.message}`);
       }
     };
 
     if (socket.connected) {
       startCapture();
     }
-
     socket.on("connect", startCapture);
 
     return () => {
@@ -161,6 +203,7 @@ function App() {
 
       // Receive screen frames from clients
       socket.on("screen-frame", ({ clientId, data }: { clientId: string; data: string }) => {
+        console.log("Received frame from:", clientId, "size:", data?.length);
         setClients((prev) => {
           const newMap = new Map(prev);
           const client = newMap.get(clientId);
@@ -416,8 +459,8 @@ function App() {
           </div>
           <div className="sidebar-footer">
             <div className="server-info">
-              <small>Server: {serverIp}:3001</small>
-              {myIp && <small>IP: {myIp}</small>}
+              {myIp && <small>Server IP: {myIp}:3001</small>}
+              {!myIp && <small>Server: localhost:3001</small>}
             </div>
           </div>
         </div>
