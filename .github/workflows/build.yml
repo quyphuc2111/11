@@ -21,8 +21,9 @@ jobs:
             server_output: server-x86_64-pc-windows-msvc.exe
           - platform: macos-latest
             args: '--target universal-apple-darwin'
-            server_target: ''
-            server_output: ''
+            server_target: node18-macos-x64,node18-macos-arm64
+            server_output_x64: server-x86_64-apple-darwin
+            server_output_arm: server-aarch64-apple-darwin
 
     runs-on: ${{ matrix.platform }}
 
@@ -47,6 +48,15 @@ jobs:
           npm install
           pkg index.js --target ${{ matrix.server_target }} --output ../src-tauri/bin/${{ matrix.server_output }}
 
+      - name: Build server binary (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          npm install -g pkg
+          cd server
+          npm install
+          pkg index.js --target node18-macos-x64 --output ../src-tauri/bin/${{ matrix.server_output_x64 }}
+          pkg index.js --target node18-macos-arm64 --output ../src-tauri/bin/${{ matrix.server_output_arm }}
+
       - name: Install frontend dependencies
         run: npm install
 
@@ -56,7 +66,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Screen Share ${{ github.ref_name }}'
+          releaseName: 'Quản Lý Phòng Máy ${{ github.ref_name }}'
           releaseBody: 'Download the installer for your platform below.'
           releaseDraft: true
           prerelease: false

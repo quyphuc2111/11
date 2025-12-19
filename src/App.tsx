@@ -1,8 +1,7 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import "./App.css";
 import io, { Socket } from "socket.io-client";
 
-const DEFAULT_SERVER_URL = "http://localhost:3001";
 const isTauri = !!(window as any).__TAURI_INTERNALS__;
 
 const USERS = {
@@ -15,7 +14,7 @@ type ClientInfo = {
   id: string;
   ip: string;
   name: string;
-  stream?: MediaStream;
+  screenData?: string; // base64 image
   isLocked: boolean;
   isSelected: boolean;
 };
@@ -39,11 +38,6 @@ function App() {
 
   const [isLocked, setIsLocked] = useState(false);
   const [lockMessage, setLockMessage] = useState("");
-  const [clientName, setClientName] = useState("");
-  const [isSharing, setIsSharing] = useState(false);
-
-  const localStream = useRef<MediaStream | null>(null);
-  const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
 
   const handleLogin = () => {
     const user = USERS[username as keyof typeof USERS];
@@ -56,6 +50,7 @@ function App() {
     }
   };
 
+  // Admin: Start server
   useEffect(() => {
     if (!isLoggedIn || role !== "admin") return;
     const startServer = async () => {
@@ -63,30 +58,82 @@ function App() {
       try {
         const { Command } = await import("@tauri-apps/plugin-shell");
         await Command.sidecar("bin/server").spawn();
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        console.error(e);
+      }
       try {
         const { Command } = await import("@tauri-apps/plugin-shell");
         const output = await Command.create("get-ip").execute();
         if (output.code === 0) setMyIp(output.stdout.trim());
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        console.error(e);
+      }
     };
     startServer();
   }, [isLoggedIn, role]);
 
+  // Socket connection
   useEffect(() => {
     if (!isLoggedIn || !role) return;
     const targetUrl = `http://${serverIp}:3001`;
     const newSocket = io(targetUrl, { autoConnect: false });
     setSocket(newSocket);
-    return () => { newSocket.disconnect(); };
+    return () => {
+      newSocket.disconnect();
+    };
   }, [serverIp, isLoggedIn, role]);
 
+  // Client: Start native screen capture
+  useEffect(() => {
+    if (!isLoggedIn || role !== "client" || !socket) return;
+    if (!isTauri) return;
+
+    let cleanup: (() => void) | null = null;
+
+    const startCapture = async () => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const { listen } = await import("@tauri-apps/api/event");
+
+        // Listen for screen frames from Rust
+        const unlisten = await listen<string>("screen-frame", (event) => {
+          socket?.emit("screen-frame", event.payload);
+        });
+
+        // Start capture loop (500ms interval = ~2 FPS)
+        await invoke("start_capture_loop", { intervalMs: 500 });
+        setStatus("Đang chia sẻ màn hình");
+
+        cleanup = () => {
+          unlisten();
+          invoke("stop_capture_loop");
+        };
+      } catch (e) {
+        console.error("Failed to start capture:", e);
+        setStatus("Lỗi capture màn hình");
+      }
+    };
+
+    if (socket.connected) {
+      startCapture();
+    }
+
+    socket.on("connect", startCapture);
+
+    return () => {
+      cleanup?.();
+      socket.off("connect", startCapture);
+    };
+  }, [isLoggedIn, role, socket]);
+
+  // Socket events
   useEffect(() => {
     if (!socket || !role) return;
 
     socket.on("connect", () => {
       setStatus("Connected");
-      socket.emit("register", { role, name: clientName || `PC-${Math.random().toString(36).substr(2, 4)}` });
+      const name = `PC-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+      socket.emit("register", { role, name });
     });
 
     socket.on("disconnect", () => setStatus("Disconnected"));
@@ -106,37 +153,26 @@ function App() {
           Array.from(newMap.keys()).forEach((id) => {
             if (!list.find((c) => c.id === id)) {
               newMap.delete(id);
-              peerConnections.current.get(id)?.close();
-              peerConnections.current.delete(id);
             }
           });
           return newMap;
         });
       });
 
-      socket.on("offer", async (payload: any) => {
-        const pc = createPeerConnection(payload.callerId);
-        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit("answer", { target: payload.callerId, sdp: pc.localDescription });
-      });
-
-      socket.on("ice-candidate", async (payload: any) => {
-        const pc = peerConnections.current.get(payload.from);
-        if (pc) await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+      // Receive screen frames from clients
+      socket.on("screen-frame", ({ clientId, data }: { clientId: string; data: string }) => {
+        setClients((prev) => {
+          const newMap = new Map(prev);
+          const client = newMap.get(clientId);
+          if (client) {
+            newMap.set(clientId, { ...client, screenData: data });
+          }
+          return newMap;
+        });
       });
     }
 
     if (role === "client") {
-      socket.on("answer", async (payload: any) => {
-        const pc = peerConnections.current.get("admin");
-        if (pc) await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-      });
-      socket.on("ice-candidate", async (payload: any) => {
-        const pc = peerConnections.current.get("admin");
-        if (pc) await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
-      });
       socket.on("lock", (data: { message: string }) => {
         setIsLocked(true);
         setLockMessage(data.message);
@@ -148,52 +184,11 @@ function App() {
     }
 
     socket.connect();
-    return () => { socket.removeAllListeners(); };
-  }, [socket, role]);
 
-  const createPeerConnection = (peerId: string) => {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
-    pc.onicecandidate = (e) => {
-      if (e.candidate) socket?.emit("ice-candidate", { target: peerId, candidate: e.candidate });
+    return () => {
+      socket.removeAllListeners();
     };
-    if (role === "admin") {
-      pc.ontrack = (e) => {
-        setClients((prev) => {
-          const newMap = new Map(prev);
-          const client = newMap.get(peerId);
-          if (client) newMap.set(peerId, { ...client, stream: e.streams[0] });
-          return newMap;
-        });
-      };
-    }
-    peerConnections.current.set(peerId, pc);
-    return pc;
-  };
-
-  const startScreenShare = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-      localStream.current = stream;
-      setIsSharing(true);
-      setStatus("Đang chia sẻ màn hình");
-
-      const pc = createPeerConnection("admin");
-      stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-
-      // Khi user stop share từ browser
-      stream.getVideoTracks()[0].onended = () => {
-        setIsSharing(false);
-        setStatus("Đã dừng chia sẻ");
-      };
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket?.emit("offer", { sdp: pc.localDescription });
-    } catch (e: any) {
-      setStatus(`Error: ${e.message}`);
-      setIsSharing(false);
-    }
-  };
+  }, [socket, role]);
 
   const lockClient = (id: string) => {
     socket?.emit("lock-client", { clientId: id, message: "Màn hình đã bị khóa" });
@@ -244,9 +239,12 @@ function App() {
 
   const getThumbnailClass = () => {
     switch (thumbnailSize) {
-      case "small": return "thumb-small";
-      case "large": return "thumb-large";
-      default: return "thumb-medium";
+      case "small":
+        return "thumb-small";
+      case "large":
+        return "thumb-large";
+      default:
+        return "thumb-medium";
     }
   };
 
@@ -257,8 +255,28 @@ function App() {
         <div className="login-box">
           <div className="login-logo">🖥️</div>
           <h1>Quản Lý Phòng Máy</h1>
-          <input type="text" placeholder="Tên đăng nhập" value={username} onChange={(e) => setUsername(e.target.value)} />
-          <input type="password" placeholder="Mật khẩu" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleLogin()} />
+          <div className="server-input">
+            <label>Server IP:</label>
+            <input
+              type="text"
+              placeholder="localhost"
+              value={serverIp}
+              onChange={(e) => setServerIp(e.target.value)}
+            />
+          </div>
+          <input
+            type="text"
+            placeholder="Tên đăng nhập"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+          <input
+            type="password"
+            placeholder="Mật khẩu"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+          />
           {loginError && <div className="login-error">{loginError}</div>}
           <button onClick={handleLogin}>Đăng nhập</button>
           <div className="login-hint">Admin: admin/admin123 | Client: client/client123</div>
@@ -283,31 +301,20 @@ function App() {
     return (
       <div className="client-page">
         <div className="client-status">
-          <div className={`status-dot ${status === "Connected" ? "online" : ""}`}></div>
+          <div className={`status-dot ${status === "Connected" || status === "Đang chia sẻ màn hình" ? "online" : ""}`}></div>
           <span>{status}</span>
         </div>
         <div className="client-content">
-          <div className="client-icon">{isSharing ? "📺" : "🖥️"}</div>
-          {isSharing ? (
-            <>
-              <h2>Đang chia sẻ màn hình</h2>
-              <p>Màn hình của bạn đang được giáo viên theo dõi</p>
-            </>
-          ) : (
-            <>
-              <h2>Sẵn sàng chia sẻ</h2>
-              <p>Nhấn nút bên dưới để bắt đầu chia sẻ màn hình</p>
-              <button className="share-btn" onClick={startScreenShare}>
-                🖥️ Bắt đầu chia sẻ màn hình
-              </button>
-            </>
-          )}
+          <div className="client-icon">📺</div>
+          <h2>Đang chia sẻ màn hình</h2>
+          <p>Màn hình của bạn đang được giáo viên theo dõi</p>
+          <p className="client-note">Ứng dụng sẽ tự động chia sẻ màn hình</p>
         </div>
       </div>
     );
   }
 
-  // Admin View - NetSupport Style
+  // Admin View
   const clientsArray = Array.from(clients.values());
   const lockedCount = clientsArray.filter((c) => c.isLocked).length;
 
@@ -325,25 +332,47 @@ function App() {
             <span className="tool-label">Mở khóa</span>
           </button>
           <div className="toolbar-divider"></div>
-          <button className="tool-btn" onClick={() => selectedClient && lockClient(selectedClient)} disabled={!selectedClient} title="Khóa máy đã chọn">
+          <button
+            className="tool-btn"
+            onClick={() => selectedClient && lockClient(selectedClient)}
+            disabled={!selectedClient}
+            title="Khóa máy đã chọn"
+          >
             <span className="tool-icon">🖥️🔒</span>
             <span className="tool-label">Khóa máy</span>
           </button>
-          <button className="tool-btn" onClick={() => selectedClient && unlockClient(selectedClient)} disabled={!selectedClient} title="Mở khóa máy đã chọn">
+          <button
+            className="tool-btn"
+            onClick={() => selectedClient && unlockClient(selectedClient)}
+            disabled={!selectedClient}
+            title="Mở khóa máy đã chọn"
+          >
             <span className="tool-icon">🖥️🔓</span>
             <span className="tool-label">Mở máy</span>
           </button>
         </div>
         <div className="toolbar-group">
           <div className="toolbar-divider"></div>
-          <button className={`tool-btn ${viewMode === "grid" ? "active" : ""}`} onClick={() => setViewMode("grid")} title="Xem dạng lưới">
+          <button
+            className={`tool-btn ${viewMode === "grid" ? "active" : ""}`}
+            onClick={() => setViewMode("grid")}
+            title="Xem dạng lưới"
+          >
             <span className="tool-icon">▦</span>
           </button>
-          <button className={`tool-btn ${viewMode === "list" ? "active" : ""}`} onClick={() => setViewMode("list")} title="Xem dạng danh sách">
+          <button
+            className={`tool-btn ${viewMode === "list" ? "active" : ""}`}
+            onClick={() => setViewMode("list")}
+            title="Xem dạng danh sách"
+          >
             <span className="tool-icon">☰</span>
           </button>
           <div className="toolbar-divider"></div>
-          <select value={thumbnailSize} onChange={(e) => setThumbnailSize(e.target.value as any)} className="size-select">
+          <select
+            value={thumbnailSize}
+            onChange={(e) => setThumbnailSize(e.target.value as any)}
+            className="size-select"
+          >
             <option value="small">Nhỏ</option>
             <option value="medium">Vừa</option>
             <option value="large">Lớn</option>
@@ -370,13 +399,17 @@ function App() {
           </div>
           <div className="client-list">
             {clientsArray.map((c) => (
-              <div key={c.id} className={`client-item ${c.isSelected ? "selected" : ""} ${c.isLocked ? "locked" : ""}`} onClick={() => selectClient(c.id)}>
+              <div
+                key={c.id}
+                className={`client-item ${c.isSelected ? "selected" : ""} ${c.isLocked ? "locked" : ""}`}
+                onClick={() => selectClient(c.id)}
+              >
                 <span className="client-icon-small">{c.isLocked ? "🔒" : "🖥️"}</span>
                 <div className="client-info">
                   <div className="client-name">{c.name}</div>
                   <div className="client-ip">{c.ip}</div>
                 </div>
-                <span className={`client-status-dot ${c.stream ? "streaming" : ""}`}></span>
+                <span className={`client-status-dot ${c.screenData ? "streaming" : ""}`}></span>
               </div>
             ))}
             {clientsArray.length === 0 && <div className="no-clients">Chưa có máy kết nối</div>}
@@ -394,14 +427,18 @@ function App() {
           {viewMode === "grid" ? (
             <div className={`screen-grid ${getThumbnailClass()}`}>
               {clientsArray.map((c) => (
-                <div key={c.id} className={`screen-card ${c.isSelected ? "selected" : ""} ${c.isLocked ? "locked" : ""}`} onClick={() => selectClient(c.id)}>
+                <div
+                  key={c.id}
+                  className={`screen-card ${c.isSelected ? "selected" : ""} ${c.isLocked ? "locked" : ""}`}
+                  onClick={() => selectClient(c.id)}
+                >
                   <div className="screen-header">
                     <span>{c.name}</span>
                     {c.isLocked && <span className="lock-badge">🔒</span>}
                   </div>
                   <div className="screen-view">
-                    {c.stream ? (
-                      <video autoPlay playsInline muted ref={(v) => { if (v && v.srcObject !== c.stream) v.srcObject = c.stream!; }} />
+                    {c.screenData ? (
+                      <img src={c.screenData} alt={c.name} />
                     ) : (
                       <div className="no-video">
                         <span>📺</span>
@@ -437,14 +474,36 @@ function App() {
                 <tbody>
                   {clientsArray.map((c) => (
                     <tr key={c.id} className={c.isSelected ? "selected" : ""} onClick={() => selectClient(c.id)}>
-                      <td><span className="list-icon">{c.isLocked ? "🔒" : "🖥️"}</span> {c.name}</td>
+                      <td>
+                        <span className="list-icon">{c.isLocked ? "🔒" : "🖥️"}</span> {c.name}
+                      </td>
                       <td>{c.ip}</td>
-                      <td><span className={`status-badge ${c.isLocked ? "locked" : "online"}`}>{c.isLocked ? "Đã khóa" : "Online"}</span></td>
+                      <td>
+                        <span className={`status-badge ${c.isLocked ? "locked" : "online"}`}>
+                          {c.isLocked ? "Đã khóa" : "Online"}
+                        </span>
+                      </td>
                       <td>
                         {c.isLocked ? (
-                          <button className="action-btn unlock" onClick={(e) => { e.stopPropagation(); unlockClient(c.id); }}>Mở khóa</button>
+                          <button
+                            className="action-btn unlock"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              unlockClient(c.id);
+                            }}
+                          >
+                            Mở khóa
+                          </button>
                         ) : (
-                          <button className="action-btn lock" onClick={(e) => { e.stopPropagation(); lockClient(c.id); }}>Khóa</button>
+                          <button
+                            className="action-btn lock"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              lockClient(c.id);
+                            }}
+                          >
+                            Khóa
+                          </button>
                         )}
                       </td>
                     </tr>

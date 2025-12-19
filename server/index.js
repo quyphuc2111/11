@@ -63,6 +63,13 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Forward screen frames from client to admin
+  socket.on("screen-frame", (data) => {
+    admins.forEach((_, adminId) => {
+      io.to(adminId).emit("screen-frame", { clientId: socket.id, data });
+    });
+  });
+
   socket.on("lock-client", ({ clientId, message }) => {
     const client = clients.get(clientId);
     if (client) {
