@@ -115,9 +115,17 @@ function App() {
           const { listen } = await import("@tauri-apps/api/event");
 
           addLog("Setting up event listener...");
+          let frameCount = 0;
           const unlisten = await listen<string>("screen-frame", (event) => {
-            addLog(`Got frame from Rust, size: ${event.payload.length}`);
-            socket?.emit("screen-frame", event.payload);
+            frameCount++;
+            if (socket?.connected) {
+              socket.emit("screen-frame", event.payload);
+              if (frameCount % 10 === 0) {
+                addLog(`Sent ${frameCount} frames (last: ${event.payload.length} bytes)`);
+              }
+            } else {
+              addLog(`Socket not connected! Frame #${frameCount} dropped`);
+            }
           });
 
           addLog("Calling start_capture_loop...");
@@ -205,11 +213,13 @@ function App() {
 
     if (role === "admin") {
       socket.on("client-list", (list: { id: string; ip: string; name: string }[]) => {
+        addLog(`Got client list: ${list.length} clients`);
         setClients((prev) => {
           const newMap = new Map(prev);
           list.forEach((c) => {
             if (!newMap.has(c.id)) {
               newMap.set(c.id, { ...c, isLocked: false, isSelected: false });
+              addLog(`New client: ${c.name} (${c.ip})`);
             } else {
               const existing = newMap.get(c.id)!;
               newMap.set(c.id, { ...existing, ip: c.ip, name: c.name });
@@ -226,12 +236,14 @@ function App() {
 
       // Receive screen frames from clients
       socket.on("screen-frame", ({ clientId, data }: { clientId: string; data: string }) => {
-        console.log("Received frame from:", clientId, "size:", data?.length);
+        addLog(`Received frame from ${clientId}, size: ${data?.length || 0}`);
         setClients((prev) => {
           const newMap = new Map(prev);
           const client = newMap.get(clientId);
           if (client) {
             newMap.set(clientId, { ...client, screenData: data });
+          } else {
+            addLog(`Client ${clientId} not found in list!`);
           }
           return newMap;
         });
@@ -588,6 +600,17 @@ function App() {
               </table>
             </div>
           )}
+        </div>
+      </div>
+
+      {/* Debug Panel for Admin */}
+      <div className="debug-panel admin-debug">
+        <h4>Debug Log:</h4>
+        <div className="debug-logs">
+          {debugLogs.map((log, i) => (
+            <div key={i} className="debug-line">{log}</div>
+          ))}
+          {debugLogs.length === 0 && <div className="debug-line">No logs yet...</div>}
         </div>
       </div>
 
