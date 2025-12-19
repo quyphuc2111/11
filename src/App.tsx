@@ -38,6 +38,12 @@ function App() {
 
   const [isLocked, setIsLocked] = useState(false);
   const [lockMessage, setLockMessage] = useState("");
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
+
+  const addLog = (msg: string) => {
+    const time = new Date().toLocaleTimeString();
+    setDebugLogs((prev) => [...prev.slice(-20), `[${time}] ${msg}`]);
+  };
 
   const handleLogin = () => {
     const user = USERS[username as keyof typeof USERS];
@@ -99,20 +105,24 @@ function App() {
       if (captureStarted) return;
       captureStarted = true;
 
-      console.log("Starting capture... isTauri:", isTauri);
+      addLog(`Starting capture... isTauri: ${isTauri}`);
 
       if (isTauri) {
         // Thử Rust capture trước
         try {
+          addLog("Importing Tauri APIs...");
           const { invoke } = await import("@tauri-apps/api/core");
           const { listen } = await import("@tauri-apps/api/event");
 
+          addLog("Setting up event listener...");
           const unlisten = await listen<string>("screen-frame", (event) => {
-            console.log("Got frame from Rust");
+            addLog(`Got frame from Rust, size: ${event.payload.length}`);
             socket?.emit("screen-frame", event.payload);
           });
 
+          addLog("Calling start_capture_loop...");
           await invoke("start_capture_loop", { intervalMs: 500 });
+          addLog("Capture loop started!");
           setStatus("Đang chia sẻ màn hình (Native)");
 
           cleanup = () => {
@@ -120,14 +130,16 @@ function App() {
             invoke("stop_capture_loop");
           };
           return;
-        } catch (e) {
-          console.error("Rust capture failed, trying browser API:", e);
+        } catch (e: any) {
+          addLog(`Rust capture failed: ${e.message || e}`);
         }
       }
 
       // Fallback: Browser getDisplayMedia (cần user click)
+      addLog("Trying browser getDisplayMedia...");
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        addLog("Got display media stream");
         const video = document.createElement("video");
         video.srcObject = stream;
         video.play();
@@ -135,6 +147,7 @@ function App() {
         const canvas = document.createElement("canvas");
         const ctx = canvas.getContext("2d")!;
 
+        let frameCount = 0;
         const captureFrame = () => {
           if (!stream.active) return;
           canvas.width = 800;
@@ -142,6 +155,8 @@ function App() {
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
           const data = canvas.toDataURL("image/jpeg", 0.6);
           socket?.emit("screen-frame", data);
+          frameCount++;
+          if (frameCount % 10 === 0) addLog(`Sent ${frameCount} frames`);
         };
 
         const interval = setInterval(captureFrame, 500);
@@ -152,7 +167,7 @@ function App() {
           stream.getTracks().forEach((t) => t.stop());
         };
       } catch (e: any) {
-        console.error("Browser capture failed:", e);
+        addLog(`Browser capture failed: ${e.message}`);
         setStatus(`Lỗi: ${e.message}`);
       }
     };
@@ -173,12 +188,20 @@ function App() {
     if (!socket || !role) return;
 
     socket.on("connect", () => {
+      addLog("Socket connected!");
       setStatus("Connected");
       const name = `PC-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
       socket.emit("register", { role, name });
     });
 
-    socket.on("disconnect", () => setStatus("Disconnected"));
+    socket.on("disconnect", () => {
+      addLog("Socket disconnected");
+      setStatus("Disconnected");
+    });
+
+    socket.on("connect_error", (err) => {
+      addLog(`Connection error: ${err.message}`);
+    });
 
     if (role === "admin") {
       socket.on("client-list", (list: { id: string; ip: string; name: string }[]) => {
@@ -344,14 +367,24 @@ function App() {
     return (
       <div className="client-page">
         <div className="client-status">
-          <div className={`status-dot ${status === "Connected" || status === "Đang chia sẻ màn hình" ? "online" : ""}`}></div>
+          <div className={`status-dot ${status.includes("Connected") || status.includes("chia sẻ") ? "online" : ""}`}></div>
           <span>{status}</span>
         </div>
         <div className="client-content">
           <div className="client-icon">📺</div>
-          <h2>Đang chia sẻ màn hình</h2>
-          <p>Màn hình của bạn đang được giáo viên theo dõi</p>
-          <p className="client-note">Ứng dụng sẽ tự động chia sẻ màn hình</p>
+          <h2>Client Mode</h2>
+          <p>Server: {serverIp}:3001</p>
+          <p className="client-note">{status}</p>
+        </div>
+        {/* Debug Log Panel */}
+        <div className="debug-panel">
+          <h4>Debug Log:</h4>
+          <div className="debug-logs">
+            {debugLogs.map((log, i) => (
+              <div key={i} className="debug-line">{log}</div>
+            ))}
+            {debugLogs.length === 0 && <div className="debug-line">No logs yet...</div>}
+          </div>
         </div>
       </div>
     );

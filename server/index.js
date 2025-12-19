@@ -65,6 +65,7 @@ io.on("connection", (socket) => {
 
   // Forward screen frames from client to admin
   socket.on("screen-frame", (data) => {
+    console.log("Received frame from", socket.id, "size:", data?.length || 0);
     admins.forEach((_, adminId) => {
       io.to(adminId).emit("screen-frame", { clientId: socket.id, data });
     });

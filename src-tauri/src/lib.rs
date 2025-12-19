@@ -2,7 +2,7 @@ use base64::{engine::general_purpose, Engine};
 use screenshots::Screen;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 
@@ -79,6 +79,15 @@ pub fn run() {
             stop_capture_loop,
             lock_input
         ])
+        .setup(|app| {
+            // Enable devtools in production
+            #[cfg(debug_assertions)]
+            {
+                let window = app.get_webview_window("main").unwrap();
+                window.open_devtools();
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
