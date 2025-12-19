@@ -105,6 +105,19 @@ io.on("connection", (socket) => {
     console.log("Unlocked all clients");
   });
 
+  // Remote control events
+  socket.on("remote-mouse-move", ({ clientId, x, y }) => {
+    io.to(clientId).emit("remote-mouse-move", { x, y });
+  });
+
+  socket.on("remote-mouse-click", ({ clientId, button }) => {
+    io.to(clientId).emit("remote-mouse-click", { button });
+  });
+
+  socket.on("remote-key-press", ({ clientId, key }) => {
+    io.to(clientId).emit("remote-key-press", { key });
+  });
+
   socket.on("disconnect", () => {
     console.log("Disconnected:", socket.id);
     if (admins.has(socket.id)) admins.delete(socket.id);

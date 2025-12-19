@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose, Engine};
+use enigo::{Enigo, Keyboard, Mouse, Settings};
 use screenshots::Screen;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,18 +14,16 @@ fn capture_screen() -> Result<String, String> {
 
     let image = screen.capture().map_err(|e| e.to_string())?;
 
-    // Resize để giảm bandwidth
     let resized = image::imageops::resize(
         &image,
-        800,
-        (800.0 * image.height() as f32 / image.width() as f32) as u32,
-        image::imageops::FilterType::Triangle,
+        640,
+        (640.0 * image.height() as f32 / image.width() as f32) as u32,
+        image::imageops::FilterType::Nearest,
     );
 
-    // Encode to JPEG
     let mut buffer = Cursor::new(Vec::new());
     resized
-        .write_to(&mut buffer, image::ImageOutputFormat::Jpeg(70))
+        .write_to(&mut buffer, image::ImageOutputFormat::Jpeg(50))
         .map_err(|e| e.to_string())?;
 
     let base64_str = general_purpose::STANDARD.encode(buffer.into_inner());
@@ -34,26 +33,17 @@ fn capture_screen() -> Result<String, String> {
 #[tauri::command]
 fn start_capture_loop(app: tauri::AppHandle, interval_ms: u64) {
     if CAPTURING.load(Ordering::SeqCst) {
-        println!("Capture already running");
         return;
     }
     CAPTURING.store(true, Ordering::SeqCst);
-    println!("Starting capture loop with interval: {}ms", interval_ms);
 
     std::thread::spawn(move || {
         while CAPTURING.load(Ordering::SeqCst) {
-            match capture_screen() {
-                Ok(data) => {
-                    println!("Captured frame, size: {} bytes", data.len());
-                    let _ = app.emit("screen-frame", data);
-                }
-                Err(e) => {
-                    println!("Capture error: {}", e);
-                }
+            if let Ok(data) = capture_screen() {
+                let _ = app.emit("screen-frame", data);
             }
             std::thread::sleep(std::time::Duration::from_millis(interval_ms));
         }
-        println!("Capture loop stopped");
     });
 }
 
@@ -63,8 +53,45 @@ fn stop_capture_loop() {
 }
 
 #[tauri::command]
-fn lock_input(lock: bool) -> Result<(), String> {
-    println!("Lock input: {}", lock);
+async fn set_lock_screen(app: tauri::AppHandle, lock: bool, _message: String) -> Result<(), String> {
+    let window = app.get_webview_window("main").ok_or("Window not found")?;
+    
+    if lock {
+        window.set_fullscreen(true).map_err(|e| e.to_string())?;
+        window.set_always_on_top(true).map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    } else {
+        window.set_always_on_top(false).map_err(|e| e.to_string())?;
+        window.set_fullscreen(false).map_err(|e| e.to_string())?;
+    }
+    
+    Ok(())
+}
+
+// Remote control commands
+#[tauri::command]
+fn remote_mouse_move(x: i32, y: i32) -> Result<(), String> {
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    enigo.move_mouse(x, y, enigo::Coordinate::Abs).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn remote_mouse_click(button: String) -> Result<(), String> {
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    let btn = match button.as_str() {
+        "right" => enigo::Button::Right,
+        "middle" => enigo::Button::Middle,
+        _ => enigo::Button::Left,
+    };
+    enigo.button(btn, enigo::Direction::Click).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn remote_key_press(key: String) -> Result<(), String> {
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    enigo.text(&key).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -77,10 +104,12 @@ pub fn run() {
             capture_screen,
             start_capture_loop,
             stop_capture_loop,
-            lock_input
+            set_lock_screen,
+            remote_mouse_move,
+            remote_mouse_click,
+            remote_key_press
         ])
         .setup(|app| {
-            // Enable devtools in production
             #[cfg(debug_assertions)]
             {
                 let window = app.get_webview_window("main").unwrap();

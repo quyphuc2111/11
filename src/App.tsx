@@ -39,6 +39,7 @@ function App() {
   const [isLocked, setIsLocked] = useState(false);
   const [lockMessage, setLockMessage] = useState("");
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
+  const [remoteControlClient, setRemoteControlClient] = useState<string | null>(null);
 
   const addLog = (msg: string) => {
     const time = new Date().toLocaleTimeString();
@@ -129,7 +130,7 @@ function App() {
           });
 
           addLog("Calling start_capture_loop...");
-          await invoke("start_capture_loop", { intervalMs: 500 });
+          await invoke("start_capture_loop", { intervalMs: 1000 }); // 1 FPS để giảm lag
           addLog("Capture loop started!");
           setStatus("Đang chia sẻ màn hình (Native)");
 
@@ -251,13 +252,71 @@ function App() {
     }
 
     if (role === "client") {
-      socket.on("lock", (data: { message: string }) => {
+      socket.on("lock", async (data: { message: string }) => {
+        addLog(`Received lock command: ${data.message}`);
         setIsLocked(true);
         setLockMessage(data.message);
+        
+        // Fullscreen + always on top
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("set_lock_screen", { lock: true, message: data.message });
+            addLog("Lock screen activated");
+          } catch (e: any) {
+            addLog(`Lock screen error: ${e.message}`);
+          }
+        }
       });
-      socket.on("unlock", () => {
+      
+      socket.on("unlock", async () => {
+        addLog("Received unlock command");
         setIsLocked(false);
         setLockMessage("");
+        
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("set_lock_screen", { lock: false, message: "" });
+            addLog("Lock screen deactivated");
+          } catch (e: any) {
+            addLog(`Unlock error: ${e.message}`);
+          }
+        }
+      });
+
+      // Remote control handlers
+      socket.on("remote-mouse-move", async ({ x, y }: { x: number; y: number }) => {
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("remote_mouse_move", { x, y });
+          } catch (e) {
+            console.error("Mouse move error:", e);
+          }
+        }
+      });
+
+      socket.on("remote-mouse-click", async ({ button }: { button: string }) => {
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("remote_mouse_click", { button });
+          } catch (e) {
+            console.error("Mouse click error:", e);
+          }
+        }
+      });
+
+      socket.on("remote-key-press", async ({ key }: { key: string }) => {
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("remote_key_press", { key });
+          } catch (e) {
+            console.error("Key press error:", e);
+          }
+        }
       });
     }
 
@@ -313,6 +372,32 @@ function App() {
       m.forEach((c, cid) => m.set(cid, { ...c, isSelected: cid === id && selectedClient !== id }));
       return m;
     });
+  };
+
+  // Remote control functions
+  const startRemoteControl = (clientId: string) => {
+    setRemoteControlClient(clientId);
+    addLog(`Started remote control for ${clientId}`);
+  };
+
+  const stopRemoteControl = () => {
+    setRemoteControlClient(null);
+    addLog("Stopped remote control");
+  };
+
+  const handleRemoteMouseMove = (e: React.MouseEvent<HTMLImageElement>, clientId: string) => {
+    if (remoteControlClient !== clientId) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = Math.round((e.clientX - rect.left) / rect.width * 1920); // Assume 1920 width
+    const y = Math.round((e.clientY - rect.top) / rect.height * 1080); // Assume 1080 height
+    socket?.emit("remote-mouse-move", { clientId, x, y });
+  };
+
+  const handleRemoteClick = (e: React.MouseEvent<HTMLImageElement>, clientId: string) => {
+    if (remoteControlClient !== clientId) return;
+    e.preventDefault();
+    const button = e.button === 2 ? "right" : e.button === 1 ? "middle" : "left";
+    socket?.emit("remote-mouse-click", { clientId, button });
   };
 
   const getThumbnailClass = () => {
@@ -405,6 +490,32 @@ function App() {
   // Admin View
   const clientsArray = Array.from(clients.values());
   const lockedCount = clientsArray.filter((c) => c.isLocked).length;
+
+  // Remote control fullscreen view
+  if (remoteControlClient) {
+    const client = clients.get(remoteControlClient);
+    return (
+      <div className="remote-control-view">
+        <div className="remote-header">
+          <span>🖱️ Điều khiển: {client?.name} ({client?.ip})</span>
+          <button onClick={stopRemoteControl}>✕ Đóng</button>
+        </div>
+        <div className="remote-screen">
+          {client?.screenData ? (
+            <img
+              src={client.screenData}
+              alt="Remote"
+              onMouseMove={(e) => handleRemoteMouseMove(e, remoteControlClient)}
+              onClick={(e) => handleRemoteClick(e, remoteControlClient)}
+              onContextMenu={(e) => { e.preventDefault(); handleRemoteClick(e, remoteControlClient); }}
+            />
+          ) : (
+            <div className="no-video">Đang kết nối...</div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="admin-page">
@@ -537,6 +648,12 @@ function App() {
                   </div>
                   <div className="screen-footer">
                     <span className="screen-ip">{c.ip}</span>
+                    <button 
+                      className="remote-btn"
+                      onClick={(e) => { e.stopPropagation(); startRemoteControl(c.id); }}
+                    >
+                      🖱️
+                    </button>
                   </div>
                 </div>
               ))}

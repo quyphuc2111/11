@@ -710,3 +710,60 @@ body {
   left: auto;
   z-index: 1000;
 }
+
+
+/* Remote Control */
+.remote-btn {
+  background: #89b4fa;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.remote-btn:hover {
+  background: #b4befe;
+}
+
+.remote-control-view {
+  position: fixed;
+  inset: 0;
+  background: #11111b;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+}
+
+.remote-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 20px;
+  background: #313244;
+  border-bottom: 1px solid #45475a;
+}
+
+.remote-header button {
+  background: #f38ba8;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 6px;
+  color: #1e1e2e;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.remote-screen {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.remote-screen img {
+  max-width: 100%;
+  max-height: 100%;
+  cursor: crosshair;
+}
