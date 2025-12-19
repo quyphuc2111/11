@@ -65,8 +65,13 @@ io.on("connection", (socket) => {
 
   // Forward screen frames from client to admin
   socket.on("screen-frame", (data) => {
-    console.log("Received frame from", socket.id, "size:", data?.length || 0);
-    admins.forEach((_, adminId) => {
+    const adminCount = admins.size;
+    console.log(`Frame from ${socket.id} (${data?.length || 0} bytes) -> ${adminCount} admins`);
+    if (adminCount === 0) {
+      console.log("WARNING: No admins connected to receive frames!");
+    }
+    admins.forEach((adminData, adminId) => {
+      console.log(`  Forwarding to admin ${adminId}`);
       io.to(adminId).emit("screen-frame", { clientId: socket.id, data });
     });
   });
@@ -111,10 +116,12 @@ io.on("connection", (socket) => {
   });
 
   socket.on("remote-mouse-click", ({ clientId, button }) => {
+    console.log("Remote click:", clientId, button);
     io.to(clientId).emit("remote-mouse-click", { button });
   });
 
   socket.on("remote-key-press", ({ clientId, key }) => {
+    console.log("Remote key:", clientId, key);
     io.to(clientId).emit("remote-key-press", { key });
   });
 

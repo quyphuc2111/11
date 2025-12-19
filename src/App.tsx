@@ -87,8 +87,14 @@ function App() {
     const targetUrl = role === "admin" 
       ? "http://localhost:3001" 
       : `http://${serverIp}:3001`;
-    console.log("Connecting to:", targetUrl);
-    const newSocket = io(targetUrl, { autoConnect: false });
+    addLog(`Connecting to: ${targetUrl}`);
+    const newSocket = io(targetUrl, { 
+      autoConnect: false,
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
+      timeout: 10000
+    });
     setSocket(newSocket);
     return () => {
       newSocket.disconnect();
@@ -121,9 +127,8 @@ function App() {
             frameCount++;
             if (socket?.connected) {
               socket.emit("screen-frame", event.payload);
-              if (frameCount % 10 === 0) {
-                addLog(`Sent ${frameCount} frames (last: ${event.payload.length} bytes)`);
-              }
+              // Log mỗi frame để debug
+              addLog(`Frame #${frameCount} sent (${event.payload.length} bytes)`);
             } else {
               addLog(`Socket not connected! Frame #${frameCount} dropped`);
             }
@@ -197,9 +202,10 @@ function App() {
     if (!socket || !role) return;
 
     socket.on("connect", () => {
-      addLog("Socket connected!");
+      addLog(`Socket connected! ID: ${socket.id}`);
       setStatus("Connected");
       const name = `PC-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+      addLog(`Registering as ${role} with name: ${name}`);
       socket.emit("register", { role, name });
     });
 
@@ -237,14 +243,25 @@ function App() {
 
       // Receive screen frames from clients
       socket.on("screen-frame", ({ clientId, data }: { clientId: string; data: string }) => {
-        addLog(`Received frame from ${clientId}, size: ${data?.length || 0}`);
+        const clientIds = Array.from(clients.keys());
+        addLog(`Frame from ${clientId} (${data?.length || 0} bytes). Known clients: ${clientIds.join(', ') || 'none'}`);
         setClients((prev) => {
           const newMap = new Map(prev);
           const client = newMap.get(clientId);
           if (client) {
             newMap.set(clientId, { ...client, screenData: data });
+            addLog(`Updated screen for ${client.name}`);
           } else {
-            addLog(`Client ${clientId} not found in list!`);
+            // Client chưa có trong list, có thể do client-list chưa được cập nhật
+            addLog(`Client ${clientId} not in list yet, creating placeholder`);
+            newMap.set(clientId, {
+              id: clientId,
+              ip: 'unknown',
+              name: `PC-${clientId.slice(0, 4)}`,
+              screenData: data,
+              isLocked: false,
+              isSelected: false
+            });
           }
           return newMap;
         });
@@ -291,30 +308,33 @@ function App() {
           try {
             const { invoke } = await import("@tauri-apps/api/core");
             await invoke("remote_mouse_move", { x, y });
-          } catch (e) {
-            console.error("Mouse move error:", e);
+          } catch (e: any) {
+            addLog(`Mouse move error: ${e.message || e}`);
           }
         }
       });
 
       socket.on("remote-mouse-click", async ({ button }: { button: string }) => {
+        addLog(`Received remote click: ${button}`);
         if (isTauri) {
           try {
             const { invoke } = await import("@tauri-apps/api/core");
             await invoke("remote_mouse_click", { button });
-          } catch (e) {
-            console.error("Mouse click error:", e);
+            addLog(`Click executed: ${button}`);
+          } catch (e: any) {
+            addLog(`Mouse click error: ${e.message || e}`);
           }
         }
       });
 
       socket.on("remote-key-press", async ({ key }: { key: string }) => {
+        addLog(`Received remote key: ${key}`);
         if (isTauri) {
           try {
             const { invoke } = await import("@tauri-apps/api/core");
             await invoke("remote_key_press", { key });
-          } catch (e) {
-            console.error("Key press error:", e);
+          } catch (e: any) {
+            addLog(`Key press error: ${e.message || e}`);
           }
         }
       });
@@ -386,18 +406,26 @@ function App() {
   };
 
   const handleRemoteMouseMove = (e: React.MouseEvent<HTMLImageElement>, clientId: string) => {
-    if (remoteControlClient !== clientId) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const x = Math.round((e.clientX - rect.left) / rect.width * 1920); // Assume 1920 width
-    const y = Math.round((e.clientY - rect.top) / rect.height * 1080); // Assume 1080 height
+    const x = Math.round((e.clientX - rect.left) / rect.width * 1920);
+    const y = Math.round((e.clientY - rect.top) / rect.height * 1080);
     socket?.emit("remote-mouse-move", { clientId, x, y });
   };
 
   const handleRemoteClick = (e: React.MouseEvent<HTMLImageElement>, clientId: string) => {
-    if (remoteControlClient !== clientId) return;
     e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = Math.round((e.clientX - rect.left) / rect.width * 1920);
+    const y = Math.round((e.clientY - rect.top) / rect.height * 1080);
     const button = e.button === 2 ? "right" : e.button === 1 ? "middle" : "left";
-    socket?.emit("remote-mouse-click", { clientId, button });
+    
+    addLog(`Remote click: ${button} at (${x}, ${y}) to ${clientId}`);
+    
+    // Gửi move trước rồi click
+    socket?.emit("remote-mouse-move", { clientId, x, y });
+    setTimeout(() => {
+      socket?.emit("remote-mouse-click", { clientId, button });
+    }, 50);
   };
 
   const getThumbnailClass = () => {

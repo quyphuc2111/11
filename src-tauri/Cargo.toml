@@ -28,3 +28,15 @@ image = "0.24"
 base64 = "0.22"
 enigo = "0.2"
 
+# WebRTC / Networking
+str0m = "0.6"
+rustls = "0.23"
+tokio = { version = "1", features = ["full"] }
+
+# Compression
+zstd = "0.13"
+openh264 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-capture = "1.4"
+
