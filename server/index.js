@@ -1,8 +1,82 @@
 const { Server } = require("socket.io");
+const dgram = require("dgram");
 
 const io = new Server(3001, {
   cors: { origin: "*" },
 });
+
+// UDP server for H.264 stream
+const udpServer = dgram.createSocket("udp4");
+const UDP_PORT = 3002;
+
+// Frame reassembly buffer
+const frameBuffers = new Map();
+
+udpServer.on("message", (msg, rinfo) => {
+  if (msg.length < 8) return;
+
+  // Parse header
+  const sequence = msg.readUInt32BE(0);
+  const chunkIndex = msg.readUInt16BE(4);
+  const totalChunks = msg.readUInt16BE(6);
+  const payload = msg.slice(8);
+
+  const clientKey = `${rinfo.address}:${rinfo.port}`;
+  
+  if (!frameBuffers.has(clientKey)) {
+    frameBuffers.set(clientKey, { sequence: -1, chunks: [], total: 0 });
+  }
+
+  const buffer = frameBuffers.get(clientKey);
+
+  // New frame started
+  if (sequence !== buffer.sequence) {
+    buffer.sequence = sequence;
+    buffer.chunks = new Array(totalChunks);
+    buffer.total = totalChunks;
+    buffer.received = 0;
+  }
+
+  // Store chunk
+  if (chunkIndex < buffer.total && !buffer.chunks[chunkIndex]) {
+    buffer.chunks[chunkIndex] = payload;
+    buffer.received++;
+
+    // Frame complete - forward to admins
+    if (buffer.received === buffer.total) {
+      const h264Frame = Buffer.concat(buffer.chunks);
+      
+      // Find client socket by IP
+      let clientSocketId = null;
+      clients.forEach((data, id) => {
+        if (data.ip === rinfo.address) {
+          clientSocketId = id;
+        }
+      });
+
+      if (clientSocketId) {
+        // Forward H.264 frame to admins
+        admins.forEach((_, adminId) => {
+          io.to(adminId).emit("h264-frame", {
+            clientId: clientSocketId,
+            data: h264Frame.toString("base64"),
+            sequence
+          });
+        });
+      }
+
+      // Reset buffer
+      buffer.chunks = [];
+      buffer.received = 0;
+    }
+  }
+});
+
+udpServer.on("listening", () => {
+  console.log(`UDP H.264 receiver on port ${UDP_PORT}`);
+});
+
+udpServer.bind(UDP_PORT);
 
 console.log("Signaling server running on port 3001");
 

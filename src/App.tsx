@@ -40,6 +40,7 @@ function App() {
   const [lockMessage, setLockMessage] = useState("");
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const [remoteControlClient, setRemoteControlClient] = useState<string | null>(null);
+  const [h264Decoders] = useState<Map<string, any>>(new Map());
 
   const addLog = (msg: string) => {
     const time = new Date().toLocaleTimeString();
@@ -115,29 +116,55 @@ function App() {
       addLog(`Starting capture... isTauri: ${isTauri}`);
 
       if (isTauri) {
-        // Thử Rust capture trước
         try {
           addLog("Importing Tauri APIs...");
           const { invoke } = await import("@tauri-apps/api/core");
           const { listen } = await import("@tauri-apps/api/event");
 
-          addLog("Setting up event listener...");
+          // Try H.264 UDP streaming first (better performance)
+          try {
+            addLog("Attempting H.264 UDP stream...");
+            const serverAddr = `${serverIp}:3002`; // UDP port
+            await invoke("start_h264_stream", { 
+              targetAddr: serverAddr, 
+              fps: 15 
+            });
+            addLog(`H.264 stream started to ${serverAddr}`);
+            setStatus("Đang stream H.264 (UDP)");
+
+            // Listen for stream errors
+            const unlistenError = await listen<string>("stream-error", (event) => {
+              addLog(`Stream error: ${event.payload}`);
+            });
+
+            cleanup = () => {
+              unlistenError();
+              invoke("stop_h264_stream");
+            };
+            return;
+          } catch (e: any) {
+            addLog(`H.264 stream failed: ${e.message}, falling back to JPEG`);
+          }
+
+          // Fallback to JPEG over WebSocket
+          addLog("Setting up JPEG event listener...");
           let frameCount = 0;
           const unlisten = await listen<string>("screen-frame", (event) => {
             frameCount++;
             if (socket?.connected) {
               socket.emit("screen-frame", event.payload);
-              // Log mỗi frame để debug
-              addLog(`Frame #${frameCount} sent (${event.payload.length} bytes)`);
+              if (frameCount % 10 === 0) {
+                addLog(`Frame #${frameCount} sent (${event.payload.length} bytes)`);
+              }
             } else {
               addLog(`Socket not connected! Frame #${frameCount} dropped`);
             }
           });
 
           addLog("Calling start_capture_loop...");
-          await invoke("start_capture_loop", { intervalMs: 1000 }); // 1 FPS để giảm lag
+          await invoke("start_capture_loop", { intervalMs: 500 }); // 2 FPS
           addLog("Capture loop started!");
-          setStatus("Đang chia sẻ màn hình (Native)");
+          setStatus("Đang chia sẻ màn hình (JPEG)");
 
           cleanup = () => {
             unlisten();
@@ -149,7 +176,7 @@ function App() {
         }
       }
 
-      // Fallback: Browser getDisplayMedia (cần user click)
+      // Fallback: Browser getDisplayMedia
       addLog("Trying browser getDisplayMedia...");
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
@@ -195,7 +222,7 @@ function App() {
       cleanup?.();
       socket.off("connect", startCapture);
     };
-  }, [isLoggedIn, role, socket]);
+  }, [isLoggedIn, role, socket, serverIp]);
 
   // Socket events
   useEffect(() => {
@@ -241,7 +268,7 @@ function App() {
         });
       });
 
-      // Receive screen frames from clients
+      // Receive screen frames from clients (JPEG fallback)
       socket.on("screen-frame", ({ clientId, data }: { clientId: string; data: string }) => {
         const clientIds = Array.from(clients.keys());
         addLog(`Frame from ${clientId} (${data?.length || 0} bytes). Known clients: ${clientIds.join(', ') || 'none'}`);
@@ -252,7 +279,6 @@ function App() {
             newMap.set(clientId, { ...client, screenData: data });
             addLog(`Updated screen for ${client.name}`);
           } else {
-            // Client chưa có trong list, có thể do client-list chưa được cập nhật
             addLog(`Client ${clientId} not in list yet, creating placeholder`);
             newMap.set(clientId, {
               id: clientId,
@@ -265,6 +291,59 @@ function App() {
           }
           return newMap;
         });
+      });
+
+      // Receive H.264 frames via UDP (decoded on server, sent as base64)
+      socket.on("h264-frame", async ({ clientId, data, sequence }: { clientId: string; data: string; sequence: number }) => {
+        try {
+          // Decode H.264 using WebCodecs API if available
+          if ('VideoDecoder' in window) {
+            const h264Data = Uint8Array.from(atob(data), c => c.charCodeAt(0));
+            
+            // Create decoder if not exists for this client
+            if (!h264Decoders.has(clientId)) {
+              const canvas = document.createElement('canvas');
+              canvas.width = 640;
+              canvas.height = 360;
+              const ctx = canvas.getContext('2d')!;
+              
+              const decoder = new (window as any).VideoDecoder({
+                output: (frame: any) => {
+                  ctx.drawImage(frame, 0, 0);
+                  const imageData = canvas.toDataURL('image/jpeg', 0.8);
+                  setClients((prev) => {
+                    const newMap = new Map(prev);
+                    const client = newMap.get(clientId);
+                    if (client) {
+                      newMap.set(clientId, { ...client, screenData: imageData });
+                    }
+                    return newMap;
+                  });
+                  frame.close();
+                },
+                error: (e: any) => addLog(`H264 decode error: ${e.message}`)
+              });
+              
+              decoder.configure({
+                codec: 'avc1.42E01E', // H.264 Baseline
+                width: 640,
+                height: 360
+              });
+              
+              h264Decoders.set(clientId, decoder);
+            }
+            
+            const decoder = h264Decoders.get(clientId);
+            const chunk = new (window as any).EncodedVideoChunk({
+              type: sequence === 0 ? 'key' : 'delta',
+              timestamp: sequence * 33333, // ~30fps
+              data: h264Data
+            });
+            decoder.decode(chunk);
+          }
+        } catch (e: any) {
+          addLog(`H264 frame error: ${e.message}`);
+        }
       });
     }
 

@@ -3231,6 +3231,7 @@ dependencies = [
  "base64 0.22.1",
  "enigo",
  "image",
+ "lazy_static",
  "openh264",
  "rustls",
  "screenshots",
