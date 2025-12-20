@@ -1,383 +1,380 @@
 use base64::{engine::general_purpose, Engine};
-use rdev::{simulate, EventType, Key, Button, SimulateError};
+use parking_lot::Mutex;
+use rdev::{simulate, Button, EventType, Key, SimulateError};
+use scrap::{Capturer, Display};
+use std::io::Cursor;
+use std::io::ErrorKind::WouldBlock;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::{thread, time::Duration};
+use std::time::Duration;
+use std::thread;
 use tauri::{Emitter, Manager};
+use tokio::sync::broadcast;
 
-#[cfg(not(target_os = "windows"))]
-use std::io::Cursor;
-
-// Platform-specific capture module
-#[cfg(target_os = "windows")]
-mod windows_capture_handler;
-
-// Cross-platform capture using screenshots crate
-#[cfg(not(target_os = "windows"))]
-use screenshots::Screen;
-
-static CAPTURING: AtomicBool = AtomicBool::new(false);
-static STREAMING: AtomicBool = AtomicBool::new(false);
-
+// ============== Global State ==============
 lazy_static::lazy_static! {
-    static ref STREAMER: Arc<Mutex<Option<UdpStreamer>>> = Arc::new(Mutex::new(None));
+    static ref CAPTURING: AtomicBool = AtomicBool::new(false);
+    static ref STREAMING: AtomicBool = AtomicBool::new(false);
+    static ref UDP_RECEIVER_RUNNING: AtomicBool = AtomicBool::new(false);
+    static ref FRAME_SENDER: Mutex<Option<broadcast::Sender<Vec<u8>>>> = Mutex::new(None);
 }
 
-// ============== Input Simulation (RustDesk style) ==============
+// ============== Screen Capture with scrap ==============
+
+fn capture_frame_bgra() -> Result<(Vec<u8>, usize, usize), String> {
+    let display = Display::primary().map_err(|e| format!("No display: {}", e))?;
+    let mut capturer = Capturer::new(display).map_err(|e| format!("Capturer error: {}", e))?;
+    
+    let width = capturer.width();
+    let height = capturer.height();
+    
+    // Try to get a frame (may need multiple attempts)
+    for _ in 0..10 {
+        match capturer.frame() {
+            Ok(frame) => {
+                return Ok((frame.to_vec(), width, height));
+            }
+            Err(ref e) if e.kind() == WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(format!("Frame error: {}", e)),
+        }
+    }
+    Err("Timeout waiting for frame".to_string())
+}
+
+fn bgra_to_jpeg(bgra: &[u8], width: usize, height: usize, quality: u8) -> Result<Vec<u8>, String> {
+    // Convert BGRA to RGB
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    let stride = bgra.len() / height;
+    
+    for y in 0..height {
+        for x in 0..width {
+            let i = y * stride + x * 4;
+            if i + 2 < bgra.len() {
+                rgb.push(bgra[i + 2]); // R
+                rgb.push(bgra[i + 1]); // G
+                rgb.push(bgra[i]);     // B
+            }
+        }
+    }
+    
+    // Create RGB image and resize
+    let img = image::RgbImage::from_raw(width as u32, height as u32, rgb)
+        .ok_or("Failed to create image")?;
+    
+    // Resize to 640px width for bandwidth
+    let target_width = 640u32;
+    let target_height = (target_width as f32 * height as f32 / width as f32) as u32;
+    let resized = image::imageops::resize(&img, target_width, target_height, image::imageops::FilterType::Nearest);
+    
+    // Encode to JPEG
+    let mut buffer = Cursor::new(Vec::new());
+    resized.write_to(&mut buffer, image::ImageOutputFormat::Jpeg(quality))
+        .map_err(|e| format!("JPEG encode error: {}", e))?;
+    
+    Ok(buffer.into_inner())
+}
+
+// ============== UDP Streaming ==============
+
+/// Start UDP streaming to server
+fn start_udp_stream(server_addr: &str, fps: u32) -> Result<(), String> {
+    if STREAMING.load(Ordering::SeqCst) {
+        return Err("Already streaming".to_string());
+    }
+    
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    socket.set_nonblocking(false).map_err(|e| e.to_string())?;
+    
+    let server = server_addr.to_string();
+    let interval = Duration::from_millis(1000 / fps as u64);
+    
+    STREAMING.store(true, Ordering::SeqCst);
+    
+    thread::spawn(move || {
+        let mut sequence: u32 = 0;
+        
+        while STREAMING.load(Ordering::SeqCst) {
+            match capture_frame_bgra() {
+                Ok((bgra, width, height)) => {
+                    if let Ok(jpeg) = bgra_to_jpeg(&bgra, width, height, 50) {
+                        // Send frame via UDP with chunking
+                        let _ = send_udp_frame(&socket, &server, &jpeg, sequence);
+                        sequence = sequence.wrapping_add(1);
+                    }
+                }
+                Err(_) => {}
+            }
+            thread::sleep(interval);
+        }
+    });
+    
+    Ok(())
+}
+
+fn send_udp_frame(socket: &UdpSocket, addr: &str, data: &[u8], sequence: u32) -> Result<(), String> {
+    const MAX_CHUNK: usize = 1400;
+    
+    let chunks: Vec<&[u8]> = data.chunks(MAX_CHUNK - 12).collect();
+    let total = chunks.len() as u16;
+    
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut packet = Vec::with_capacity(chunk.len() + 12);
+        // Header: magic(2) + seq(4) + idx(2) + total(2) + len(2)
+        packet.extend_from_slice(b"SC"); // Magic bytes
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&(i as u16).to_be_bytes());
+        packet.extend_from_slice(&total.to_be_bytes());
+        packet.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        packet.extend_from_slice(chunk);
+        
+        socket.send_to(&packet, addr).map_err(|e| e.to_string())?;
+    }
+    
+    Ok(())
+}
+
+// ============== TCP Server for Admin ==============
+
+/// Start TCP server to receive and broadcast frames
+fn start_frame_server(port: u16) -> Result<broadcast::Receiver<Vec<u8>>, String> {
+    let (tx, rx) = broadcast::channel::<Vec<u8>>(16);
+    
+    {
+        let mut sender = FRAME_SENDER.lock();
+        *sender = Some(tx.clone());
+    }
+    
+    // Start UDP receiver
+    if !UDP_RECEIVER_RUNNING.load(Ordering::SeqCst) {
+        UDP_RECEIVER_RUNNING.store(true, Ordering::SeqCst);
+        
+        let udp_port = port;
+        thread::spawn(move || {
+            let socket = match UdpSocket::bind(format!("0.0.0.0:{}", udp_port)) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("UDP bind error: {}", e);
+                    UDP_RECEIVER_RUNNING.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            
+            let mut frame_buffers: std::collections::HashMap<u32, FrameBuffer> = std::collections::HashMap::new();
+            let mut buf = [0u8; 1500];
+            
+            while UDP_RECEIVER_RUNNING.load(Ordering::SeqCst) {
+                match socket.recv_from(&mut buf) {
+                    Ok((len, _addr)) => {
+                        if len < 12 || &buf[0..2] != b"SC" {
+                            continue;
+                        }
+                        
+                        let seq = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+                        let idx = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+                        let total = u16::from_be_bytes([buf[8], buf[9]]) as usize;
+                        let chunk_len = u16::from_be_bytes([buf[10], buf[11]]) as usize;
+                        
+                        if 12 + chunk_len > len {
+                            continue;
+                        }
+                        
+                        let chunk = &buf[12..12 + chunk_len];
+                        
+                        let fb = frame_buffers.entry(seq).or_insert_with(|| FrameBuffer::new(total));
+                        
+                        if fb.add_chunk(idx, chunk) {
+                            if let Some(frame) = fb.complete() {
+                                if let Some(sender) = FRAME_SENDER.lock().as_ref() {
+                                    let _ = sender.send(frame);
+                                }
+                            }
+                            frame_buffers.remove(&seq);
+                            
+                            // Clean old buffers
+                            frame_buffers.retain(|&k, _| k > seq.saturating_sub(10));
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+    
+    Ok(rx)
+}
+
+struct FrameBuffer {
+    chunks: Vec<Option<Vec<u8>>>,
+    received: usize,
+    total: usize,
+}
+
+impl FrameBuffer {
+    fn new(total: usize) -> Self {
+        Self {
+            chunks: vec![None; total],
+            received: 0,
+            total,
+        }
+    }
+    
+    fn add_chunk(&mut self, idx: usize, data: &[u8]) -> bool {
+        if idx < self.total && self.chunks[idx].is_none() {
+            self.chunks[idx] = Some(data.to_vec());
+            self.received += 1;
+        }
+        self.received == self.total
+    }
+    
+    fn complete(&self) -> Option<Vec<u8>> {
+        if self.received != self.total {
+            return None;
+        }
+        
+        let mut result = Vec::new();
+        for chunk in &self.chunks {
+            if let Some(data) = chunk {
+                result.extend_from_slice(data);
+            }
+        }
+        Some(result)
+    }
+}
+
+// ============== Input Simulation ==============
 
 fn send_event(event_type: &EventType) -> Result<(), String> {
     match simulate(event_type) {
         Ok(()) => {
-            // Small delay for OS to process (RustDesk does this too)
             thread::sleep(Duration::from_millis(10));
             Ok(())
         }
-        Err(SimulateError) => Err(format!("Failed to simulate event: {:?}", event_type)),
+        Err(SimulateError) => Err(format!("Failed to simulate: {:?}", event_type)),
     }
 }
 
-// Convert JavaScript key code to rdev Key
 fn js_key_to_rdev(key: &str, code: &str) -> Option<Key> {
-    // First try by code (physical key position)
     match code {
-        // Letters
-        "KeyA" => Some(Key::KeyA),
-        "KeyB" => Some(Key::KeyB),
-        "KeyC" => Some(Key::KeyC),
-        "KeyD" => Some(Key::KeyD),
-        "KeyE" => Some(Key::KeyE),
-        "KeyF" => Some(Key::KeyF),
-        "KeyG" => Some(Key::KeyG),
-        "KeyH" => Some(Key::KeyH),
-        "KeyI" => Some(Key::KeyI),
-        "KeyJ" => Some(Key::KeyJ),
-        "KeyK" => Some(Key::KeyK),
-        "KeyL" => Some(Key::KeyL),
-        "KeyM" => Some(Key::KeyM),
-        "KeyN" => Some(Key::KeyN),
-        "KeyO" => Some(Key::KeyO),
-        "KeyP" => Some(Key::KeyP),
-        "KeyQ" => Some(Key::KeyQ),
-        "KeyR" => Some(Key::KeyR),
-        "KeyS" => Some(Key::KeyS),
-        "KeyT" => Some(Key::KeyT),
-        "KeyU" => Some(Key::KeyU),
-        "KeyV" => Some(Key::KeyV),
-        "KeyW" => Some(Key::KeyW),
-        "KeyX" => Some(Key::KeyX),
-        "KeyY" => Some(Key::KeyY),
-        "KeyZ" => Some(Key::KeyZ),
-        
-        // Numbers
-        "Digit0" => Some(Key::Num0),
-        "Digit1" => Some(Key::Num1),
-        "Digit2" => Some(Key::Num2),
-        "Digit3" => Some(Key::Num3),
-        "Digit4" => Some(Key::Num4),
-        "Digit5" => Some(Key::Num5),
-        "Digit6" => Some(Key::Num6),
-        "Digit7" => Some(Key::Num7),
-        "Digit8" => Some(Key::Num8),
+        "KeyA" => Some(Key::KeyA), "KeyB" => Some(Key::KeyB), "KeyC" => Some(Key::KeyC),
+        "KeyD" => Some(Key::KeyD), "KeyE" => Some(Key::KeyE), "KeyF" => Some(Key::KeyF),
+        "KeyG" => Some(Key::KeyG), "KeyH" => Some(Key::KeyH), "KeyI" => Some(Key::KeyI),
+        "KeyJ" => Some(Key::KeyJ), "KeyK" => Some(Key::KeyK), "KeyL" => Some(Key::KeyL),
+        "KeyM" => Some(Key::KeyM), "KeyN" => Some(Key::KeyN), "KeyO" => Some(Key::KeyO),
+        "KeyP" => Some(Key::KeyP), "KeyQ" => Some(Key::KeyQ), "KeyR" => Some(Key::KeyR),
+        "KeyS" => Some(Key::KeyS), "KeyT" => Some(Key::KeyT), "KeyU" => Some(Key::KeyU),
+        "KeyV" => Some(Key::KeyV), "KeyW" => Some(Key::KeyW), "KeyX" => Some(Key::KeyX),
+        "KeyY" => Some(Key::KeyY), "KeyZ" => Some(Key::KeyZ),
+        "Digit0" => Some(Key::Num0), "Digit1" => Some(Key::Num1), "Digit2" => Some(Key::Num2),
+        "Digit3" => Some(Key::Num3), "Digit4" => Some(Key::Num4), "Digit5" => Some(Key::Num5),
+        "Digit6" => Some(Key::Num6), "Digit7" => Some(Key::Num7), "Digit8" => Some(Key::Num8),
         "Digit9" => Some(Key::Num9),
-        
-        // Function keys
-        "F1" => Some(Key::F1),
-        "F2" => Some(Key::F2),
-        "F3" => Some(Key::F3),
-        "F4" => Some(Key::F4),
-        "F5" => Some(Key::F5),
-        "F6" => Some(Key::F6),
-        "F7" => Some(Key::F7),
-        "F8" => Some(Key::F8),
-        "F9" => Some(Key::F9),
-        "F10" => Some(Key::F10),
-        "F11" => Some(Key::F11),
-        "F12" => Some(Key::F12),
-        
-        // Special keys
-        "Enter" => Some(Key::Return),
-        "NumpadEnter" => Some(Key::Return),
-        "Escape" => Some(Key::Escape),
-        "Backspace" => Some(Key::Backspace),
-        "Tab" => Some(Key::Tab),
-        "Space" => Some(Key::Space),
-        "Delete" => Some(Key::Delete),
-        "Insert" => Some(Key::Insert),
-        "Home" => Some(Key::Home),
-        "End" => Some(Key::End),
-        "PageUp" => Some(Key::PageUp),
-        "PageDown" => Some(Key::PageDown),
-        
-        // Arrow keys
-        "ArrowUp" => Some(Key::UpArrow),
-        "ArrowDown" => Some(Key::DownArrow),
-        "ArrowLeft" => Some(Key::LeftArrow),
-        "ArrowRight" => Some(Key::RightArrow),
-        
-        // Modifiers
+        "F1" => Some(Key::F1), "F2" => Some(Key::F2), "F3" => Some(Key::F3), "F4" => Some(Key::F4),
+        "F5" => Some(Key::F5), "F6" => Some(Key::F6), "F7" => Some(Key::F7), "F8" => Some(Key::F8),
+        "F9" => Some(Key::F9), "F10" => Some(Key::F10), "F11" => Some(Key::F11), "F12" => Some(Key::F12),
+        "Enter" | "NumpadEnter" => Some(Key::Return),
+        "Escape" => Some(Key::Escape), "Backspace" => Some(Key::Backspace),
+        "Tab" => Some(Key::Tab), "Space" => Some(Key::Space),
+        "Delete" => Some(Key::Delete), "Insert" => Some(Key::Insert),
+        "Home" => Some(Key::Home), "End" => Some(Key::End),
+        "PageUp" => Some(Key::PageUp), "PageDown" => Some(Key::PageDown),
+        "ArrowUp" => Some(Key::UpArrow), "ArrowDown" => Some(Key::DownArrow),
+        "ArrowLeft" => Some(Key::LeftArrow), "ArrowRight" => Some(Key::RightArrow),
         "ShiftLeft" | "ShiftRight" => Some(Key::ShiftLeft),
         "ControlLeft" | "ControlRight" => Some(Key::ControlLeft),
         "AltLeft" | "AltRight" => Some(Key::Alt),
         "MetaLeft" | "MetaRight" => Some(Key::MetaLeft),
-        
-        // Punctuation
-        "Minus" => Some(Key::Minus),
-        "Equal" => Some(Key::Equal),
-        "BracketLeft" => Some(Key::LeftBracket),
-        "BracketRight" => Some(Key::RightBracket),
-        "Backslash" => Some(Key::BackSlash),
-        "Semicolon" => Some(Key::SemiColon),
-        "Quote" => Some(Key::Quote),
-        "Backquote" => Some(Key::BackQuote),
-        "Comma" => Some(Key::Comma),
-        "Period" => Some(Key::Dot),
-        "Slash" => Some(Key::Slash),
-        
-        // Numpad
-        "Numpad0" => Some(Key::Kp0),
-        "Numpad1" => Some(Key::Kp1),
-        "Numpad2" => Some(Key::Kp2),
-        "Numpad3" => Some(Key::Kp3),
-        "Numpad4" => Some(Key::Kp4),
-        "Numpad5" => Some(Key::Kp5),
-        "Numpad6" => Some(Key::Kp6),
-        "Numpad7" => Some(Key::Kp7),
-        "Numpad8" => Some(Key::Kp8),
-        "Numpad9" => Some(Key::Kp9),
-        "NumpadMultiply" => Some(Key::KpMultiply),
-        "NumpadAdd" => Some(Key::KpPlus),
-        "NumpadSubtract" => Some(Key::KpMinus),
-        "NumpadDecimal" => Some(Key::KpDelete),
-        "NumpadDivide" => Some(Key::KpDivide),
-        
-        // CapsLock, etc
-        "CapsLock" => Some(Key::CapsLock),
-        "PrintScreen" => Some(Key::PrintScreen),
-        "ScrollLock" => Some(Key::ScrollLock),
-        "Pause" => Some(Key::Pause),
-        
-        _ => {
-            // Fallback: try by key name
-            match key {
-                " " => Some(Key::Space),
-                _ => None,
-            }
-        }
-    }
-}
-
-// ============== UDP Streamer ==============
-struct UdpStreamer {
-    socket: UdpSocket,
-    target_addr: String,
-    sequence: u32,
-}
-
-impl UdpStreamer {
-    fn new(target_addr: &str) -> Result<Self, String> {
-        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-        socket.set_nonblocking(true).map_err(|e| e.to_string())?;
-        Ok(Self {
-            socket,
-            target_addr: target_addr.to_string(),
-            sequence: 0,
-        })
-    }
-
-    fn send_frame(&mut self, data: &[u8]) -> Result<(), String> {
-        const MAX_PACKET_SIZE: usize = 1400;
-        
-        let chunks: Vec<&[u8]> = data.chunks(MAX_PACKET_SIZE - 8).collect();
-        let total_chunks = chunks.len() as u16;
-
-        for (i, chunk) in chunks.iter().enumerate() {
-            let mut packet = Vec::with_capacity(chunk.len() + 8);
-            packet.extend_from_slice(&self.sequence.to_be_bytes());
-            packet.extend_from_slice(&(i as u16).to_be_bytes());
-            packet.extend_from_slice(&total_chunks.to_be_bytes());
-            packet.extend_from_slice(chunk);
-
-            self.socket
-                .send_to(&packet, &self.target_addr)
-                .map_err(|e| e.to_string())?;
-        }
-        
-        self.sequence = self.sequence.wrapping_add(1);
-        Ok(())
+        _ => if key == " " { Some(Key::Space) } else { None }
     }
 }
 
 // ============== Tauri Commands ==============
 
-/// Capture a single screenshot
 #[tauri::command]
 fn capture_screen() -> Result<String, String> {
-    #[cfg(target_os = "windows")]
-    {
-        windows_capture_handler::capture_single_frame()
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let screens = Screen::all().map_err(|e| e.to_string())?;
-        let screen = screens.first().ok_or("No screen found")?;
-        let image = screen.capture().map_err(|e| e.to_string())?;
-
-        let resized = image::imageops::resize(
-            &image,
-            640,
-            (640.0 * image.height() as f32 / image.width() as f32) as u32,
-            image::imageops::FilterType::Nearest,
-        );
-
-        let mut buffer = Cursor::new(Vec::new());
-        resized
-            .write_to(&mut buffer, image::ImageOutputFormat::Jpeg(50))
-            .map_err(|e| e.to_string())?;
-
-        let base64_str = general_purpose::STANDARD.encode(buffer.into_inner());
-        Ok(format!("data:image/jpeg;base64,{}", base64_str))
-    }
+    let (bgra, width, height) = capture_frame_bgra()?;
+    let jpeg = bgra_to_jpeg(&bgra, width, height, 50)?;
+    let base64_str = general_purpose::STANDARD.encode(&jpeg);
+    Ok(format!("data:image/jpeg;base64,{}", base64_str))
 }
 
-/// Start continuous screen capture loop
 #[tauri::command]
-fn start_capture_loop(app: tauri::AppHandle, _interval_ms: u64) {
+fn start_capture_loop(app: tauri::AppHandle, interval_ms: u64) {
     if CAPTURING.load(Ordering::SeqCst) {
         return;
     }
     CAPTURING.store(true, Ordering::SeqCst);
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Err(e) = windows_capture_handler::start_capture(app.clone()) {
-            let _ = app.emit("capture-error", e);
-            CAPTURING.store(false, Ordering::SeqCst);
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let interval_ms = _interval_ms;
-        std::thread::spawn(move || {
-            while CAPTURING.load(Ordering::SeqCst) {
-                if let Ok(data) = capture_screen() {
-                    let _ = app.emit("screen-frame", data);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    
+    thread::spawn(move || {
+        while CAPTURING.load(Ordering::SeqCst) {
+            if let Ok(data) = capture_screen() {
+                let _ = app.emit("screen-frame", data);
             }
-        });
-    }
+            thread::sleep(Duration::from_millis(interval_ms));
+        }
+    });
 }
 
-/// Stop screen capture loop
 #[tauri::command]
 fn stop_capture_loop() {
     CAPTURING.store(false, Ordering::SeqCst);
-    
-    #[cfg(target_os = "windows")]
-    {
-        windows_capture_handler::stop_capture();
-    }
 }
 
-/// Start UDP streaming
+/// Start UDP streaming to server (for client)
 #[tauri::command]
-fn start_h264_stream(app: tauri::AppHandle, target_addr: String, fps: u32) -> Result<(), String> {
-    if STREAMING.load(Ordering::SeqCst) {
-        return Err("Already streaming".to_string());
-    }
+fn start_stream(server_addr: String, fps: u32) -> Result<(), String> {
+    start_udp_stream(&server_addr, fps)
+}
 
-    {
-        let mut streamer_guard = STREAMER.lock().map_err(|e| e.to_string())?;
-        *streamer_guard = Some(UdpStreamer::new(&target_addr)?);
-    }
+#[tauri::command]
+fn stop_stream() {
+    STREAMING.store(false, Ordering::SeqCst);
+}
 
-    STREAMING.store(true, Ordering::SeqCst);
-    let interval = std::time::Duration::from_millis(1000 / fps as u64);
-
-    std::thread::spawn(move || {
-        while STREAMING.load(Ordering::SeqCst) {
-            #[cfg(target_os = "windows")]
-            let frame_data = windows_capture_handler::get_last_frame();
-            
-            #[cfg(not(target_os = "windows"))]
-            let frame_data = capture_screen().ok();
-
-            if let Some(data) = frame_data {
-                if let Some(base64_part) = data.strip_prefix("data:image/jpeg;base64,") {
-                    if let Ok(bytes) = general_purpose::STANDARD.decode(base64_part) {
-                        if let Ok(mut guard) = STREAMER.lock() {
-                            if let Some(streamer) = guard.as_mut() {
-                                if let Err(e) = streamer.send_frame(&bytes) {
-                                    let _ = app.emit("stream-error", e);
-                                }
-                            }
-                        }
-                    }
+/// Start frame receiver server (for admin)
+#[tauri::command]
+fn start_frame_receiver(app: tauri::AppHandle, port: u16) -> Result<(), String> {
+    let mut rx = start_frame_server(port)?;
+    
+    thread::spawn(move || {
+        loop {
+            match rx.blocking_recv() {
+                Ok(frame) => {
+                    let base64_str = general_purpose::STANDARD.encode(&frame);
+                    let data_url = format!("data:image/jpeg;base64,{}", base64_str);
+                    let _ = app.emit("udp-frame", data_url);
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(10));
                 }
             }
-            std::thread::sleep(interval);
         }
     });
-
+    
     Ok(())
 }
 
-/// Stop UDP streaming
 #[tauri::command]
-fn stop_h264_stream() {
-    STREAMING.store(false, Ordering::SeqCst);
-    if let Ok(mut streamer_guard) = STREAMER.lock() {
-        *streamer_guard = None;
-    }
+fn stop_frame_receiver() {
+    UDP_RECEIVER_RUNNING.store(false, Ordering::SeqCst);
 }
 
-/// Get streaming statistics
-#[tauri::command]
-fn get_stream_stats() -> Result<serde_json::Value, String> {
-    let is_streaming = STREAMING.load(Ordering::SeqCst);
-    let is_capturing = CAPTURING.load(Ordering::SeqCst);
-    let sequence = if let Ok(guard) = STREAMER.lock() {
-        guard.as_ref().map(|s| s.sequence).unwrap_or(0)
-    } else {
-        0
-    };
-
-    Ok(serde_json::json!({
-        "streaming": is_streaming,
-        "capturing": is_capturing,
-        "frames_sent": sequence
-    }))
-}
-
-/// Get screen size for remote control coordinate mapping
 #[tauri::command]
 fn get_screen_size() -> Result<serde_json::Value, String> {
     match rdev::display_size() {
-        Ok((width, height)) => Ok(serde_json::json!({
-            "width": width,
-            "height": height
-        })),
+        Ok((width, height)) => Ok(serde_json::json!({ "width": width, "height": height })),
         Err(_) => {
-            // Fallback to screenshots crate
-            let screens = screenshots::Screen::all().map_err(|e| e.to_string())?;
-            let screen = screens.first().ok_or("No screen found")?;
-            let info = screen.display_info;
-            Ok(serde_json::json!({
-                "width": info.width,
-                "height": info.height
-            }))
+            let display = Display::primary().map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "width": display.width(), "height": display.height() }))
         }
     }
 }
 
-/// Lock/unlock client screen
 #[tauri::command]
 async fn set_lock_screen(app: tauri::AppHandle, lock: bool, _message: String) -> Result<(), String> {
     let window = app.get_webview_window("main").ok_or("Window not found")?;
-    
     if lock {
         window.set_fullscreen(true).map_err(|e| e.to_string())?;
         window.set_always_on_top(true).map_err(|e| e.to_string())?;
@@ -386,17 +383,14 @@ async fn set_lock_screen(app: tauri::AppHandle, lock: bool, _message: String) ->
         window.set_always_on_top(false).map_err(|e| e.to_string())?;
         window.set_fullscreen(false).map_err(|e| e.to_string())?;
     }
-    
     Ok(())
 }
 
-/// Remote mouse move (RustDesk style using rdev)
 #[tauri::command]
 fn remote_mouse_move(x: f64, y: f64) -> Result<(), String> {
     send_event(&EventType::MouseMove { x, y })
 }
 
-/// Remote mouse click (RustDesk style using rdev)
 #[tauri::command]
 fn remote_mouse_click(button: String) -> Result<(), String> {
     let btn = match button.as_str() {
@@ -404,76 +398,32 @@ fn remote_mouse_click(button: String) -> Result<(), String> {
         "middle" => Button::Middle,
         _ => Button::Left,
     };
-    
-    // Press and release (click)
     send_event(&EventType::ButtonPress(btn))?;
     send_event(&EventType::ButtonRelease(btn))
 }
 
-/// Remote mouse scroll (RustDesk style)
 #[tauri::command]
 fn remote_mouse_scroll(delta_x: i64, delta_y: i64) -> Result<(), String> {
     send_event(&EventType::Wheel { delta_x, delta_y })
 }
 
-/// Remote key press (RustDesk style using rdev)
 #[tauri::command]
 fn remote_key_press(key: String, code: String, ctrl: bool, alt: bool, shift: bool, meta: bool) -> Result<(), String> {
-    // Press modifiers first
-    if ctrl {
-        send_event(&EventType::KeyPress(Key::ControlLeft))?;
-    }
-    if alt {
-        send_event(&EventType::KeyPress(Key::Alt))?;
-    }
-    if shift {
-        send_event(&EventType::KeyPress(Key::ShiftLeft))?;
-    }
-    if meta {
-        send_event(&EventType::KeyPress(Key::MetaLeft))?;
-    }
+    if ctrl { send_event(&EventType::KeyPress(Key::ControlLeft))?; }
+    if alt { send_event(&EventType::KeyPress(Key::Alt))?; }
+    if shift { send_event(&EventType::KeyPress(Key::ShiftLeft))?; }
+    if meta { send_event(&EventType::KeyPress(Key::MetaLeft))?; }
 
-    // Press and release the main key
     if let Some(rdev_key) = js_key_to_rdev(&key, &code) {
         send_event(&EventType::KeyPress(rdev_key))?;
         send_event(&EventType::KeyRelease(rdev_key))?;
     }
 
-    // Release modifiers
-    if meta {
-        send_event(&EventType::KeyRelease(Key::MetaLeft))?;
-    }
-    if shift {
-        send_event(&EventType::KeyRelease(Key::ShiftLeft))?;
-    }
-    if alt {
-        send_event(&EventType::KeyRelease(Key::Alt))?;
-    }
-    if ctrl {
-        send_event(&EventType::KeyRelease(Key::ControlLeft))?;
-    }
-
+    if meta { send_event(&EventType::KeyRelease(Key::MetaLeft))?; }
+    if shift { send_event(&EventType::KeyRelease(Key::ShiftLeft))?; }
+    if alt { send_event(&EventType::KeyRelease(Key::Alt))?; }
+    if ctrl { send_event(&EventType::KeyRelease(Key::ControlLeft))?; }
     Ok(())
-}
-
-/// Remote key down (for held keys)
-#[tauri::command]
-fn remote_key_down(key: String, code: String) -> Result<(), String> {
-    if let Some(rdev_key) = js_key_to_rdev(&key, &code) {
-        send_event(&EventType::KeyPress(rdev_key))
-    } else {
-        Ok(())
-    }
-}
-
-/// Remote key up (for released keys)
-#[tauri::command]
-fn remote_key_up(key: String, code: String) -> Result<(), String> {
-    if let Some(rdev_key) = js_key_to_rdev(&key, &code) {
-        send_event(&EventType::KeyRelease(rdev_key))
-    } else {
-        Ok(())
-    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -485,17 +435,16 @@ pub fn run() {
             capture_screen,
             start_capture_loop,
             stop_capture_loop,
-            start_h264_stream,
-            stop_h264_stream,
-            get_stream_stats,
+            start_stream,
+            stop_stream,
+            start_frame_receiver,
+            stop_frame_receiver,
             get_screen_size,
             set_lock_screen,
             remote_mouse_move,
             remote_mouse_click,
             remote_mouse_scroll,
-            remote_key_press,
-            remote_key_down,
-            remote_key_up
+            remote_key_press
         ])
         .setup(|_app| {
             #[cfg(debug_assertions)]

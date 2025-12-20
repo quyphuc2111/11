@@ -23,25 +23,19 @@ tauri-plugin-shell = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-screenshots = "0.8"
 image = "0.24"
 base64 = "0.22"
+
+# Screen capture (original scrap - simpler than RustDesk's fork)
+scrap = "0.5"
 
 # Input simulation (like RustDesk)
 rdev = "0.5"
 
-# WebRTC / Networking
-str0m = "0.6"
-rustls = "0.23"
-tokio = { version = "1", features = ["full"] }
-
-# Compression
-zstd = "0.13"
-openh264 = "0.6"
+# Async runtime for networking
+tokio = { version = "1", features = ["full", "net", "io-util", "sync"] }
 
 # Utils
 lazy_static = "1.4"
-
-[target.'cfg(windows)'.dependencies]
-windows-capture = "1.4"
+parking_lot = "0.12"
 
