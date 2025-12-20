@@ -767,3 +767,20 @@ body {
   max-height: 100%;
   cursor: crosshair;
 }
+
+.remote-footer {
+  padding: 8px 20px;
+  background: #313244;
+  border-top: 1px solid #45475a;
+  text-align: center;
+  color: #6c7086;
+}
+
+.screen-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 14px;
+  font-size: 11px;
+  color: #6c7086;
+}

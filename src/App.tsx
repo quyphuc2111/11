@@ -345,6 +345,12 @@ function App() {
           addLog(`H264 frame error: ${e.message}`);
         }
       });
+
+      // Receive screen size from client for remote control
+      socket.on("screen-size", ({ clientId, width, height }: { clientId: string; width: number; height: number }) => {
+        addLog(`Screen size from ${clientId}: ${width}x${height}`);
+        setRemoteScreenSize({ width, height });
+      });
     }
 
     if (role === "client") {
@@ -381,14 +387,14 @@ function App() {
         }
       });
 
-      // Remote control handlers
+      // Remote control handlers (RustDesk style)
       socket.on("remote-mouse-move", async ({ x, y }: { x: number; y: number }) => {
         if (isTauri) {
           try {
             const { invoke } = await import("@tauri-apps/api/core");
             await invoke("remote_mouse_move", { x, y });
           } catch (e: any) {
-            addLog(`Mouse move error: ${e.message || e}`);
+            // Silent fail for mouse move
           }
         }
       });
@@ -406,15 +412,44 @@ function App() {
         }
       });
 
-      socket.on("remote-key-press", async ({ key }: { key: string }) => {
-        addLog(`Received remote key: ${key}`);
+      socket.on("remote-mouse-scroll", async ({ deltaX, deltaY }: { deltaX: number; deltaY: number }) => {
         if (isTauri) {
           try {
             const { invoke } = await import("@tauri-apps/api/core");
-            await invoke("remote_key_press", { key });
+            await invoke("remote_mouse_scroll", { deltaX, deltaY });
+          } catch (e: any) {
+            addLog(`Scroll error: ${e.message || e}`);
+          }
+        }
+      });
+
+      socket.on("remote-key-press", async ({ key, code, ctrl, alt, shift, meta }: { key: string; code?: string; ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean }) => {
+        addLog(`Received remote key: ${key} (code: ${code})`);
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("remote_key_press", { key, code: code || "", ctrl: ctrl || false, alt: alt || false, shift: shift || false, meta: meta || false });
           } catch (e: any) {
             addLog(`Key press error: ${e.message || e}`);
           }
+        }
+      });
+
+      // Handle screen size request
+      socket.on("request-screen-size", async () => {
+        addLog("Screen size requested");
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            const size = await invoke<{ width: number; height: number }>("get_screen_size");
+            socket.emit("screen-size-response", size);
+            addLog(`Sent screen size: ${size.width}x${size.height}`);
+          } catch (e: any) {
+            socket.emit("screen-size-response", { width: window.screen.width, height: window.screen.height });
+            addLog(`Sent fallback screen size: ${window.screen.width}x${window.screen.height}`);
+          }
+        } else {
+          socket.emit("screen-size-response", { width: window.screen.width, height: window.screen.height });
         }
       });
     }
@@ -474,9 +509,14 @@ function App() {
   };
 
   // Remote control functions
+  const [lastMouseMove, setLastMouseMove] = useState(0);
+  const [remoteScreenSize, setRemoteScreenSize] = useState({ width: 1920, height: 1080 });
+
   const startRemoteControl = (clientId: string) => {
     setRemoteControlClient(clientId);
     addLog(`Started remote control for ${clientId}`);
+    // Request screen size from client
+    socket?.emit("request-screen-size", { clientId });
   };
 
   const stopRemoteControl = () => {
@@ -484,27 +524,68 @@ function App() {
     addLog("Stopped remote control");
   };
 
-  const handleRemoteMouseMove = (e: React.MouseEvent<HTMLImageElement>, clientId: string) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = Math.round((e.clientX - rect.left) / rect.width * 1920);
-    const y = Math.round((e.clientY - rect.top) / rect.height * 1080);
+  const handleRemoteMouseMove = (e: React.MouseEvent<HTMLDivElement>, clientId: string) => {
+    // Throttle mouse move to 60fps max
+    const now = Date.now();
+    if (now - lastMouseMove < 16) return;
+    setLastMouseMove(now);
+
+    const img = e.currentTarget.querySelector('img');
+    if (!img) return;
+    
+    const rect = img.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width * remoteScreenSize.width;
+    const y = (e.clientY - rect.top) / rect.height * remoteScreenSize.height;
+    
     socket?.emit("remote-mouse-move", { clientId, x, y });
   };
 
-  const handleRemoteClick = (e: React.MouseEvent<HTMLImageElement>, clientId: string) => {
+  const handleRemoteClick = (e: React.MouseEvent<HTMLDivElement>, clientId: string) => {
     e.preventDefault();
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = Math.round((e.clientX - rect.left) / rect.width * 1920);
-    const y = Math.round((e.clientY - rect.top) / rect.height * 1080);
+    const img = e.currentTarget.querySelector('img');
+    if (!img) return;
+    
+    const rect = img.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width * remoteScreenSize.width;
+    const y = (e.clientY - rect.top) / rect.height * remoteScreenSize.height;
     const button = e.button === 2 ? "right" : e.button === 1 ? "middle" : "left";
     
-    addLog(`Remote click: ${button} at (${x}, ${y}) to ${clientId}`);
+    addLog(`Remote click: ${button} at (${Math.round(x)}, ${Math.round(y)}) to ${clientId}`);
     
-    // Gửi move trước rồi click
+    // Move then click
     socket?.emit("remote-mouse-move", { clientId, x, y });
     setTimeout(() => {
       socket?.emit("remote-mouse-click", { clientId, button });
-    }, 50);
+    }, 20);
+  };
+
+  const handleRemoteScroll = (e: React.WheelEvent<HTMLDivElement>, clientId: string) => {
+    e.preventDefault();
+    const deltaX = Math.sign(e.deltaX) * -1;
+    const deltaY = Math.sign(e.deltaY) * -1;
+    socket?.emit("remote-mouse-scroll", { clientId, deltaX, deltaY });
+  };
+
+  const handleRemoteKeyDown = (e: React.KeyboardEvent, clientId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    
+    // ESC to exit remote control
+    if (e.key === "Escape" && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      stopRemoteControl();
+      return;
+    }
+    
+    addLog(`Remote key: ${e.key} (${e.code}) to ${clientId}`);
+    socket?.emit("remote-key-press", { 
+      clientId, 
+      key: e.key, 
+      code: e.code, 
+      ctrl: e.ctrlKey, 
+      alt: e.altKey, 
+      shift: e.shiftKey,
+      meta: e.metaKey
+    });
   };
 
   const getThumbnailClass = () => {
@@ -602,23 +683,36 @@ function App() {
   if (remoteControlClient) {
     const client = clients.get(remoteControlClient);
     return (
-      <div className="remote-control-view">
+      <div 
+        className="remote-control-view"
+        tabIndex={0}
+        onKeyDown={(e) => handleRemoteKeyDown(e, remoteControlClient)}
+        autoFocus
+      >
         <div className="remote-header">
-          <span>🖱️ Điều khiển: {client?.name} ({client?.ip})</span>
-          <button onClick={stopRemoteControl}>✕ Đóng</button>
+          <span>🖱️ Điều khiển: {client?.name} ({client?.ip}) - {remoteScreenSize.width}x{remoteScreenSize.height}</span>
+          <button onClick={stopRemoteControl}>✕ Đóng (ESC)</button>
         </div>
-        <div className="remote-screen">
+        <div 
+          className="remote-screen"
+          onMouseMove={(e) => handleRemoteMouseMove(e, remoteControlClient)}
+          onClick={(e) => handleRemoteClick(e, remoteControlClient)}
+          onContextMenu={(e) => { e.preventDefault(); handleRemoteClick(e, remoteControlClient); }}
+          onWheel={(e) => handleRemoteScroll(e, remoteControlClient)}
+        >
           {client?.screenData ? (
             <img
               src={client.screenData}
               alt="Remote"
-              onMouseMove={(e) => handleRemoteMouseMove(e, remoteControlClient)}
-              onClick={(e) => handleRemoteClick(e, remoteControlClient)}
-              onContextMenu={(e) => { e.preventDefault(); handleRemoteClick(e, remoteControlClient); }}
+              draggable={false}
+              style={{ cursor: 'none', pointerEvents: 'none' }}
             />
           ) : (
             <div className="no-video">Đang kết nối...</div>
           )}
+        </div>
+        <div className="remote-footer">
+          <small>Di chuột và click để điều khiển | Scroll để cuộn | Nhấn phím để gõ | ESC để thoát</small>
         </div>
       </div>
     );

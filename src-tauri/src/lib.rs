@@ -1,73 +1,171 @@
 use base64::{engine::general_purpose, Engine};
-use enigo::{Enigo, Keyboard, Mouse, Settings};
-use openh264::encoder::Encoder;
-use openh264::formats::YUVBuffer;
-use screenshots::Screen;
+use rdev::{simulate, EventType, Key, Button, SimulateError};
 use std::io::Cursor;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::{thread, time::Duration};
 use tauri::{Emitter, Manager};
+
+// Platform-specific capture module
+#[cfg(target_os = "windows")]
+mod windows_capture_handler;
+
+// Cross-platform capture using screenshots crate
+#[cfg(not(target_os = "windows"))]
+use screenshots::Screen;
 
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 static STREAMING: AtomicBool = AtomicBool::new(false);
 
-// H.264 Encoder wrapper
-struct H264Encoder {
-    encoder: Encoder,
-    width: usize,
-    height: usize,
+lazy_static::lazy_static! {
+    static ref STREAMER: Arc<Mutex<Option<UdpStreamer>>> = Arc::new(Mutex::new(None));
 }
 
-impl H264Encoder {
-    fn new(width: usize, height: usize) -> Result<Self, String> {
-        let encoder = Encoder::new().map_err(|e| e.to_string())?;
-        Ok(Self { encoder, width, height })
+// ============== Input Simulation (RustDesk style) ==============
+
+fn send_event(event_type: &EventType) -> Result<(), String> {
+    match simulate(event_type) {
+        Ok(()) => {
+            // Small delay for OS to process (RustDesk does this too)
+            thread::sleep(Duration::from_millis(10));
+            Ok(())
+        }
+        Err(SimulateError) => Err(format!("Failed to simulate event: {:?}", event_type)),
     }
+}
 
-    fn encode_frame(&mut self, rgba_data: &[u8]) -> Result<Vec<u8>, String> {
-        let yuv = Self::rgba_to_yuv420(rgba_data, self.width, self.height);
-        let yuv_buffer = YUVBuffer::from_vec(yuv, self.width, self.height);
+// Convert JavaScript key code to rdev Key
+fn js_key_to_rdev(key: &str, code: &str) -> Option<Key> {
+    // First try by code (physical key position)
+    match code {
+        // Letters
+        "KeyA" => Some(Key::KeyA),
+        "KeyB" => Some(Key::KeyB),
+        "KeyC" => Some(Key::KeyC),
+        "KeyD" => Some(Key::KeyD),
+        "KeyE" => Some(Key::KeyE),
+        "KeyF" => Some(Key::KeyF),
+        "KeyG" => Some(Key::KeyG),
+        "KeyH" => Some(Key::KeyH),
+        "KeyI" => Some(Key::KeyI),
+        "KeyJ" => Some(Key::KeyJ),
+        "KeyK" => Some(Key::KeyK),
+        "KeyL" => Some(Key::KeyL),
+        "KeyM" => Some(Key::KeyM),
+        "KeyN" => Some(Key::KeyN),
+        "KeyO" => Some(Key::KeyO),
+        "KeyP" => Some(Key::KeyP),
+        "KeyQ" => Some(Key::KeyQ),
+        "KeyR" => Some(Key::KeyR),
+        "KeyS" => Some(Key::KeyS),
+        "KeyT" => Some(Key::KeyT),
+        "KeyU" => Some(Key::KeyU),
+        "KeyV" => Some(Key::KeyV),
+        "KeyW" => Some(Key::KeyW),
+        "KeyX" => Some(Key::KeyX),
+        "KeyY" => Some(Key::KeyY),
+        "KeyZ" => Some(Key::KeyZ),
         
-        let bitstream = self.encoder
-            .encode(&yuv_buffer)
-            .map_err(|e| e.to_string())?;
+        // Numbers
+        "Digit0" => Some(Key::Num0),
+        "Digit1" => Some(Key::Num1),
+        "Digit2" => Some(Key::Num2),
+        "Digit3" => Some(Key::Num3),
+        "Digit4" => Some(Key::Num4),
+        "Digit5" => Some(Key::Num5),
+        "Digit6" => Some(Key::Num6),
+        "Digit7" => Some(Key::Num7),
+        "Digit8" => Some(Key::Num8),
+        "Digit9" => Some(Key::Num9),
         
-        Ok(bitstream.to_vec())
-    }
-
-    fn rgba_to_yuv420(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
-        let mut yuv = vec![0u8; width * height * 3 / 2];
+        // Function keys
+        "F1" => Some(Key::F1),
+        "F2" => Some(Key::F2),
+        "F3" => Some(Key::F3),
+        "F4" => Some(Key::F4),
+        "F5" => Some(Key::F5),
+        "F6" => Some(Key::F6),
+        "F7" => Some(Key::F7),
+        "F8" => Some(Key::F8),
+        "F9" => Some(Key::F9),
+        "F10" => Some(Key::F10),
+        "F11" => Some(Key::F11),
+        "F12" => Some(Key::F12),
         
-        let (y_plane, uv_planes) = yuv.split_at_mut(width * height);
-        let (u_plane, v_plane) = uv_planes.split_at_mut(width * height / 4);
-
-        for y in 0..height {
-            for x in 0..width {
-                let idx = (y * width + x) * 4;
-                let r = rgba[idx] as f32;
-                let g = rgba[idx + 1] as f32;
-                let b = rgba[idx + 2] as f32;
-
-                // RGB to YUV conversion (BT.601)
-                let y_val = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
-                y_plane[y * width + x] = y_val;
-
-                // Subsample U and V (2x2 blocks)
-                if y % 2 == 0 && x % 2 == 0 {
-                    let u_val = (128.0 - 0.169 * r - 0.331 * g + 0.5 * b) as u8;
-                    let v_val = (128.0 + 0.5 * r - 0.419 * g - 0.081 * b) as u8;
-                    let uv_idx = (y / 2) * (width / 2) + (x / 2);
-                    u_plane[uv_idx] = u_val;
-                    v_plane[uv_idx] = v_val;
-                }
+        // Special keys
+        "Enter" => Some(Key::Return),
+        "NumpadEnter" => Some(Key::Return),
+        "Escape" => Some(Key::Escape),
+        "Backspace" => Some(Key::Backspace),
+        "Tab" => Some(Key::Tab),
+        "Space" => Some(Key::Space),
+        "Delete" => Some(Key::Delete),
+        "Insert" => Some(Key::Insert),
+        "Home" => Some(Key::Home),
+        "End" => Some(Key::End),
+        "PageUp" => Some(Key::PageUp),
+        "PageDown" => Some(Key::PageDown),
+        
+        // Arrow keys
+        "ArrowUp" => Some(Key::UpArrow),
+        "ArrowDown" => Some(Key::DownArrow),
+        "ArrowLeft" => Some(Key::LeftArrow),
+        "ArrowRight" => Some(Key::RightArrow),
+        
+        // Modifiers
+        "ShiftLeft" | "ShiftRight" => Some(Key::ShiftLeft),
+        "ControlLeft" | "ControlRight" => Some(Key::ControlLeft),
+        "AltLeft" | "AltRight" => Some(Key::Alt),
+        "MetaLeft" | "MetaRight" => Some(Key::MetaLeft),
+        
+        // Punctuation
+        "Minus" => Some(Key::Minus),
+        "Equal" => Some(Key::Equal),
+        "BracketLeft" => Some(Key::LeftBracket),
+        "BracketRight" => Some(Key::RightBracket),
+        "Backslash" => Some(Key::BackSlash),
+        "Semicolon" => Some(Key::SemiColon),
+        "Quote" => Some(Key::Quote),
+        "Backquote" => Some(Key::BackQuote),
+        "Comma" => Some(Key::Comma),
+        "Period" => Some(Key::Dot),
+        "Slash" => Some(Key::Slash),
+        
+        // Numpad
+        "Numpad0" => Some(Key::Kp0),
+        "Numpad1" => Some(Key::Kp1),
+        "Numpad2" => Some(Key::Kp2),
+        "Numpad3" => Some(Key::Kp3),
+        "Numpad4" => Some(Key::Kp4),
+        "Numpad5" => Some(Key::Kp5),
+        "Numpad6" => Some(Key::Kp6),
+        "Numpad7" => Some(Key::Kp7),
+        "Numpad8" => Some(Key::Kp8),
+        "Numpad9" => Some(Key::Kp9),
+        "NumpadMultiply" => Some(Key::KpMultiply),
+        "NumpadAdd" => Some(Key::KpPlus),
+        "NumpadSubtract" => Some(Key::KpMinus),
+        "NumpadDecimal" => Some(Key::KpDelete),
+        "NumpadDivide" => Some(Key::KpDivide),
+        
+        // CapsLock, etc
+        "CapsLock" => Some(Key::CapsLock),
+        "PrintScreen" => Some(Key::PrintScreen),
+        "ScrollLock" => Some(Key::ScrollLock),
+        "Pause" => Some(Key::Pause),
+        
+        _ => {
+            // Fallback: try by key name
+            match key {
+                " " => Some(Key::Space),
+                _ => None,
             }
         }
-        yuv
     }
 }
 
-// UDP Streamer for video frames
+// ============== UDP Streamer ==============
 struct UdpStreamer {
     socket: UdpSocket,
     target_addr: String,
@@ -85,15 +183,14 @@ impl UdpStreamer {
         })
     }
 
-    fn send_frame(&mut self, h264_data: &[u8]) -> Result<(), String> {
-        const MAX_PACKET_SIZE: usize = 1400; // MTU safe size
+    fn send_frame(&mut self, data: &[u8]) -> Result<(), String> {
+        const MAX_PACKET_SIZE: usize = 1400;
         
-        let chunks: Vec<&[u8]> = h264_data.chunks(MAX_PACKET_SIZE - 8).collect();
+        let chunks: Vec<&[u8]> = data.chunks(MAX_PACKET_SIZE - 8).collect();
         let total_chunks = chunks.len() as u16;
 
         for (i, chunk) in chunks.iter().enumerate() {
             let mut packet = Vec::with_capacity(chunk.len() + 8);
-            // Header: sequence(4) + chunk_index(2) + total_chunks(2)
             packet.extend_from_slice(&self.sequence.to_be_bytes());
             packet.extend_from_slice(&(i as u16).to_be_bytes());
             packet.extend_from_slice(&total_chunks.to_be_bytes());
@@ -109,63 +206,40 @@ impl UdpStreamer {
     }
 }
 
-// Global state for streaming
-lazy_static::lazy_static! {
-    static ref ENCODER: Arc<Mutex<Option<H264Encoder>>> = Arc::new(Mutex::new(None));
-    static ref STREAMER: Arc<Mutex<Option<UdpStreamer>>> = Arc::new(Mutex::new(None));
-}
+// ============== Tauri Commands ==============
 
+/// Capture a single screenshot
 #[tauri::command]
 fn capture_screen() -> Result<String, String> {
-    let screens = Screen::all().map_err(|e| e.to_string())?;
-    let screen = screens.first().ok_or("No screen found")?;
-
-    let image = screen.capture().map_err(|e| e.to_string())?;
-
-    let resized = image::imageops::resize(
-        &image,
-        640,
-        (640.0 * image.height() as f32 / image.width() as f32) as u32,
-        image::imageops::FilterType::Nearest,
-    );
-
-    let mut buffer = Cursor::new(Vec::new());
-    resized
-        .write_to(&mut buffer, image::ImageOutputFormat::Jpeg(50))
-        .map_err(|e| e.to_string())?;
-
-    let base64_str = general_purpose::STANDARD.encode(buffer.into_inner());
-    Ok(format!("data:image/jpeg;base64,{}", base64_str))
-}
-
-#[tauri::command]
-fn capture_screen_h264() -> Result<Vec<u8>, String> {
-    let screens = Screen::all().map_err(|e| e.to_string())?;
-    let screen = screens.first().ok_or("No screen found")?;
-    let image = screen.capture().map_err(|e| e.to_string())?;
-
-    let width = 640usize;
-    let height = (640.0 * image.height() as f32 / image.width() as f32) as usize;
-    let height = height - (height % 2); // Must be even for YUV420
-
-    let resized = image::imageops::resize(
-        &image,
-        width as u32,
-        height as u32,
-        image::imageops::FilterType::Nearest,
-    );
-
-    let rgba_data: Vec<u8> = resized.into_raw();
-
-    let mut encoder_guard = ENCODER.lock().map_err(|e| e.to_string())?;
-    if encoder_guard.is_none() {
-        *encoder_guard = Some(H264Encoder::new(width, height)?);
+    #[cfg(target_os = "windows")]
+    {
+        windows_capture_handler::capture_single_frame()
     }
 
-    let encoder = encoder_guard.as_mut().unwrap();
-    encoder.encode_frame(&rgba_data)
+    #[cfg(not(target_os = "windows"))]
+    {
+        let screens = Screen::all().map_err(|e| e.to_string())?;
+        let screen = screens.first().ok_or("No screen found")?;
+        let image = screen.capture().map_err(|e| e.to_string())?;
+
+        let resized = image::imageops::resize(
+            &image,
+            640,
+            (640.0 * image.height() as f32 / image.width() as f32) as u32,
+            image::imageops::FilterType::Nearest,
+        );
+
+        let mut buffer = Cursor::new(Vec::new());
+        resized
+            .write_to(&mut buffer, image::ImageOutputFormat::Jpeg(50))
+            .map_err(|e| e.to_string())?;
+
+        let base64_str = general_purpose::STANDARD.encode(buffer.into_inner());
+        Ok(format!("data:image/jpeg;base64,{}", base64_str))
+    }
 }
 
+/// Start continuous screen capture loop
 #[tauri::command]
 fn start_capture_loop(app: tauri::AppHandle, interval_ms: u64) {
     if CAPTURING.load(Ordering::SeqCst) {
@@ -173,29 +247,45 @@ fn start_capture_loop(app: tauri::AppHandle, interval_ms: u64) {
     }
     CAPTURING.store(true, Ordering::SeqCst);
 
-    std::thread::spawn(move || {
-        while CAPTURING.load(Ordering::SeqCst) {
-            if let Ok(data) = capture_screen() {
-                let _ = app.emit("screen-frame", data);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = windows_capture_handler::start_capture(app.clone()) {
+            let _ = app.emit("capture-error", e);
+            CAPTURING.store(false, Ordering::SeqCst);
         }
-    });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::thread::spawn(move || {
+            while CAPTURING.load(Ordering::SeqCst) {
+                if let Ok(data) = capture_screen() {
+                    let _ = app.emit("screen-frame", data);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
+        });
+    }
 }
 
+/// Stop screen capture loop
 #[tauri::command]
 fn stop_capture_loop() {
     CAPTURING.store(false, Ordering::SeqCst);
+    
+    #[cfg(target_os = "windows")]
+    {
+        windows_capture_handler::stop_capture();
+    }
 }
 
-// Start H.264 UDP streaming
+/// Start UDP streaming
 #[tauri::command]
 fn start_h264_stream(app: tauri::AppHandle, target_addr: String, fps: u32) -> Result<(), String> {
     if STREAMING.load(Ordering::SeqCst) {
         return Err("Already streaming".to_string());
     }
 
-    // Initialize streamer
     {
         let mut streamer_guard = STREAMER.lock().map_err(|e| e.to_string())?;
         *streamer_guard = Some(UdpStreamer::new(&target_addr)?);
@@ -206,18 +296,23 @@ fn start_h264_stream(app: tauri::AppHandle, target_addr: String, fps: u32) -> Re
 
     std::thread::spawn(move || {
         while STREAMING.load(Ordering::SeqCst) {
-            match capture_screen_h264() {
-                Ok(h264_data) => {
-                    if let Ok(mut streamer_guard) = STREAMER.lock() {
-                        if let Some(streamer) = streamer_guard.as_mut() {
-                            if let Err(e) = streamer.send_frame(&h264_data) {
-                                let _ = app.emit("stream-error", e);
+            #[cfg(target_os = "windows")]
+            let frame_data = windows_capture_handler::get_last_frame();
+            
+            #[cfg(not(target_os = "windows"))]
+            let frame_data = capture_screen().ok();
+
+            if let Some(data) = frame_data {
+                if let Some(base64_part) = data.strip_prefix("data:image/jpeg;base64,") {
+                    if let Ok(bytes) = general_purpose::STANDARD.decode(base64_part) {
+                        if let Ok(mut guard) = STREAMER.lock() {
+                            if let Some(streamer) = guard.as_mut() {
+                                if let Err(e) = streamer.send_frame(&bytes) {
+                                    let _ = app.emit("stream-error", e);
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    let _ = app.emit("stream-error", e);
                 }
             }
             std::thread::sleep(interval);
@@ -227,6 +322,7 @@ fn start_h264_stream(app: tauri::AppHandle, target_addr: String, fps: u32) -> Re
     Ok(())
 }
 
+/// Stop UDP streaming
 #[tauri::command]
 fn stop_h264_stream() {
     STREAMING.store(false, Ordering::SeqCst);
@@ -235,10 +331,11 @@ fn stop_h264_stream() {
     }
 }
 
-// Get streaming stats
+/// Get streaming statistics
 #[tauri::command]
 fn get_stream_stats() -> Result<serde_json::Value, String> {
     let is_streaming = STREAMING.load(Ordering::SeqCst);
+    let is_capturing = CAPTURING.load(Ordering::SeqCst);
     let sequence = if let Ok(guard) = STREAMER.lock() {
         guard.as_ref().map(|s| s.sequence).unwrap_or(0)
     } else {
@@ -247,10 +344,33 @@ fn get_stream_stats() -> Result<serde_json::Value, String> {
 
     Ok(serde_json::json!({
         "streaming": is_streaming,
+        "capturing": is_capturing,
         "frames_sent": sequence
     }))
 }
 
+/// Get screen size for remote control coordinate mapping
+#[tauri::command]
+fn get_screen_size() -> Result<serde_json::Value, String> {
+    match rdev::display_size() {
+        Ok((width, height)) => Ok(serde_json::json!({
+            "width": width,
+            "height": height
+        })),
+        Err(_) => {
+            // Fallback to screenshots crate
+            let screens = screenshots::Screen::all().map_err(|e| e.to_string())?;
+            let screen = screens.first().ok_or("No screen found")?;
+            let info = screen.display_info;
+            Ok(serde_json::json!({
+                "width": info.width,
+                "height": info.height
+            }))
+        }
+    }
+}
+
+/// Lock/unlock client screen
 #[tauri::command]
 async fn set_lock_screen(app: tauri::AppHandle, lock: bool, _message: String) -> Result<(), String> {
     let window = app.get_webview_window("main").ok_or("Window not found")?;
@@ -267,31 +387,90 @@ async fn set_lock_screen(app: tauri::AppHandle, lock: bool, _message: String) ->
     Ok(())
 }
 
-// Remote control commands
+/// Remote mouse move (RustDesk style using rdev)
 #[tauri::command]
-fn remote_mouse_move(x: i32, y: i32) -> Result<(), String> {
-    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
-    enigo.move_mouse(x, y, enigo::Coordinate::Abs).map_err(|e| e.to_string())?;
-    Ok(())
+fn remote_mouse_move(x: f64, y: f64) -> Result<(), String> {
+    send_event(&EventType::MouseMove { x, y })
 }
 
+/// Remote mouse click (RustDesk style using rdev)
 #[tauri::command]
 fn remote_mouse_click(button: String) -> Result<(), String> {
-    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
     let btn = match button.as_str() {
-        "right" => enigo::Button::Right,
-        "middle" => enigo::Button::Middle,
-        _ => enigo::Button::Left,
+        "right" => Button::Right,
+        "middle" => Button::Middle,
+        _ => Button::Left,
     };
-    enigo.button(btn, enigo::Direction::Click).map_err(|e| e.to_string())?;
+    
+    // Press and release (click)
+    send_event(&EventType::ButtonPress(btn))?;
+    send_event(&EventType::ButtonRelease(btn))
+}
+
+/// Remote mouse scroll (RustDesk style)
+#[tauri::command]
+fn remote_mouse_scroll(delta_x: i64, delta_y: i64) -> Result<(), String> {
+    send_event(&EventType::Wheel { delta_x, delta_y })
+}
+
+/// Remote key press (RustDesk style using rdev)
+#[tauri::command]
+fn remote_key_press(key: String, code: String, ctrl: bool, alt: bool, shift: bool, meta: bool) -> Result<(), String> {
+    // Press modifiers first
+    if ctrl {
+        send_event(&EventType::KeyPress(Key::ControlLeft))?;
+    }
+    if alt {
+        send_event(&EventType::KeyPress(Key::Alt))?;
+    }
+    if shift {
+        send_event(&EventType::KeyPress(Key::ShiftLeft))?;
+    }
+    if meta {
+        send_event(&EventType::KeyPress(Key::MetaLeft))?;
+    }
+
+    // Press and release the main key
+    if let Some(rdev_key) = js_key_to_rdev(&key, &code) {
+        send_event(&EventType::KeyPress(rdev_key))?;
+        send_event(&EventType::KeyRelease(rdev_key))?;
+    }
+
+    // Release modifiers
+    if meta {
+        send_event(&EventType::KeyRelease(Key::MetaLeft))?;
+    }
+    if shift {
+        send_event(&EventType::KeyRelease(Key::ShiftLeft))?;
+    }
+    if alt {
+        send_event(&EventType::KeyRelease(Key::Alt))?;
+    }
+    if ctrl {
+        send_event(&EventType::KeyRelease(Key::ControlLeft))?;
+    }
+
     Ok(())
 }
 
+/// Remote key down (for held keys)
 #[tauri::command]
-fn remote_key_press(key: String) -> Result<(), String> {
-    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
-    enigo.text(&key).map_err(|e| e.to_string())?;
-    Ok(())
+fn remote_key_down(key: String, code: String) -> Result<(), String> {
+    if let Some(rdev_key) = js_key_to_rdev(&key, &code) {
+        send_event(&EventType::KeyPress(rdev_key))
+    } else {
+        Ok(())
+    }
+}
+
+/// Remote key up (for released keys)
+#[tauri::command]
+fn remote_key_up(key: String, code: String) -> Result<(), String> {
+    if let Some(rdev_key) = js_key_to_rdev(&key, &code) {
+        send_event(&EventType::KeyRelease(rdev_key))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -301,16 +480,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             capture_screen,
-            capture_screen_h264,
             start_capture_loop,
             stop_capture_loop,
             start_h264_stream,
             stop_h264_stream,
             get_stream_stats,
+            get_screen_size,
             set_lock_screen,
             remote_mouse_move,
             remote_mouse_click,
-            remote_key_press
+            remote_mouse_scroll,
+            remote_key_press,
+            remote_key_down,
+            remote_key_up
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]

@@ -184,7 +184,7 @@ io.on("connection", (socket) => {
     console.log("Unlocked all clients");
   });
 
-  // Remote control events
+  // Remote control events (RustDesk style)
   socket.on("remote-mouse-move", ({ clientId, x, y }) => {
     io.to(clientId).emit("remote-mouse-move", { x, y });
   });
@@ -194,9 +194,27 @@ io.on("connection", (socket) => {
     io.to(clientId).emit("remote-mouse-click", { button });
   });
 
-  socket.on("remote-key-press", ({ clientId, key }) => {
-    console.log("Remote key:", clientId, key);
-    io.to(clientId).emit("remote-key-press", { key });
+  socket.on("remote-mouse-scroll", ({ clientId, deltaX, deltaY }) => {
+    io.to(clientId).emit("remote-mouse-scroll", { deltaX, deltaY });
+  });
+
+  socket.on("remote-key-press", ({ clientId, key, code, ctrl, alt, shift, meta }) => {
+    console.log("Remote key:", clientId, key, code);
+    io.to(clientId).emit("remote-key-press", { key, code, ctrl, alt, shift, meta });
+  });
+
+  // Screen size request/response
+  socket.on("request-screen-size", ({ clientId }) => {
+    console.log("Screen size request for:", clientId);
+    io.to(clientId).emit("request-screen-size");
+  });
+
+  socket.on("screen-size-response", (data) => {
+    console.log("Screen size response:", data);
+    // Forward to all admins
+    admins.forEach((_, adminId) => {
+      io.to(adminId).emit("screen-size", { clientId: socket.id, ...data });
+    });
   });
 
   socket.on("disconnect", () => {

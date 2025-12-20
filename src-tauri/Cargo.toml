@@ -26,7 +26,9 @@ serde_json = "1"
 screenshots = "0.8"
 image = "0.24"
 base64 = "0.22"
-enigo = "0.2"
+
+# Input simulation (like RustDesk)
+rdev = "0.5"
 
 # WebRTC / Networking
 str0m = "0.6"
