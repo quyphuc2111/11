@@ -13,7 +13,10 @@ use windows_capture::{
     frame::Frame,
     graphics_capture_api::InternalCaptureControl,
     monitor::Monitor,
-    settings::{ColorFormat, CursorCaptureSettings, DrawBorderSettings, Settings},
+    settings::{
+        ColorFormat, CursorCaptureSettings, DrawBorderSettings, Settings,
+        SecondaryWindowSettings, MinimumUpdateIntervalSettings, DirtyRegionSettings,
+    },
 };
 
 // Shared state
@@ -53,7 +56,7 @@ impl GraphicsCaptureApiHandler for StreamingCapture {
         self.frame_count += 1;
 
         // Get frame buffer
-        let buffer = frame.buffer()?;
+        let mut buffer = frame.buffer()?;
         let width = buffer.width();
         let height = buffer.height();
         
@@ -131,7 +134,10 @@ pub fn start_capture(app_handle: tauri::AppHandle) -> Result<(), String> {
             monitor,
             CursorCaptureSettings::WithCursor,
             DrawBorderSettings::WithoutBorder,
-            ColorFormat::Bgra8, // Windows native format
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
             app_handle,
         );
 
@@ -181,7 +187,7 @@ pub fn capture_single_frame() -> Result<String, String> {
             frame: &mut Frame,
             capture_control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
-            let buffer = frame.buffer()?;
+            let mut buffer = frame.buffer()?;
             let width = buffer.width();
             let height = buffer.height();
             let raw_data = buffer.as_raw_buffer();
@@ -232,6 +238,9 @@ pub fn capture_single_frame() -> Result<String, String> {
             monitor,
             CursorCaptureSettings::WithCursor,
             DrawBorderSettings::WithoutBorder,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
             tx,
         );

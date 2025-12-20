@@ -1,11 +1,13 @@
 use base64::{engine::general_purpose, Engine};
 use rdev::{simulate, EventType, Key, Button, SimulateError};
-use std::io::Cursor;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{thread, time::Duration};
 use tauri::{Emitter, Manager};
+
+#[cfg(not(target_os = "windows"))]
+use std::io::Cursor;
 
 // Platform-specific capture module
 #[cfg(target_os = "windows")]
@@ -241,7 +243,7 @@ fn capture_screen() -> Result<String, String> {
 
 /// Start continuous screen capture loop
 #[tauri::command]
-fn start_capture_loop(app: tauri::AppHandle, interval_ms: u64) {
+fn start_capture_loop(app: tauri::AppHandle, _interval_ms: u64) {
     if CAPTURING.load(Ordering::SeqCst) {
         return;
     }
@@ -257,6 +259,7 @@ fn start_capture_loop(app: tauri::AppHandle, interval_ms: u64) {
 
     #[cfg(not(target_os = "windows"))]
     {
+        let interval_ms = _interval_ms;
         std::thread::spawn(move || {
             while CAPTURING.load(Ordering::SeqCst) {
                 if let Ok(data) = capture_screen() {
@@ -494,10 +497,10 @@ pub fn run() {
             remote_key_down,
             remote_key_up
         ])
-        .setup(|app| {
+        .setup(|_app| {
             #[cfg(debug_assertions)]
             {
-                let window = app.get_webview_window("main").unwrap();
+                let window = _app.get_webview_window("main").unwrap();
                 window.open_devtools();
             }
             Ok(())
