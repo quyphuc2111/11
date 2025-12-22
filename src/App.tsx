@@ -43,9 +43,59 @@ function App() {
   const [h264Decoders] = useState<Map<string, any>>(new Map());
   const [h264Canvases] = useState<Map<string, HTMLCanvasElement>>(new Map());
 
+  // LAN Scan & WOL states
+  const [lanHosts, setLanHosts] = useState<{ip: string; hasApp: boolean; online: boolean; mac?: string}[]>([]);
+  const [isScanning, setIsScanning] = useState(false);
+  const [wolMac, setWolMac] = useState("");
+  const [showLanPanel, setShowLanPanel] = useState(false);
+
   const addLog = (msg: string) => {
     const time = new Date().toLocaleTimeString();
     setDebugLogs((prev) => [...prev.slice(-20), `[${time}] ${msg}`]);
+  };
+
+  // LAN Scan function
+  const scanLan = async () => {
+    if (!isTauri) {
+      addLog("LAN scan only works in Tauri app");
+      return;
+    }
+    
+    setIsScanning(true);
+    setLanHosts([]);
+    addLog("Starting LAN scan...");
+    
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const hosts = await invoke<{ip: string; hasApp: boolean; online: boolean}[]>("scan_lan");
+      setLanHosts(hosts);
+      addLog(`LAN scan complete: ${hosts.length} hosts found`);
+    } catch (e: any) {
+      addLog(`LAN scan error: ${e.message || e}`);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  // Wake-on-LAN function
+  const sendWol = async (mac: string) => {
+    if (!isTauri) {
+      addLog("WOL only works in Tauri app");
+      return;
+    }
+    
+    if (!mac || mac.length < 17) {
+      addLog("Invalid MAC address");
+      return;
+    }
+    
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result = await invoke<string>("wake_on_lan", { macAddress: mac });
+      addLog(result);
+    } catch (e: any) {
+      addLog(`WOL error: ${e.message || e}`);
+    }
   };
 
   const handleLogin = () => {
@@ -908,6 +958,25 @@ function App() {
         <div className="toolbar-group">
           <div className="toolbar-divider"></div>
           <button
+            className={`tool-btn ${showLanPanel ? "active" : ""}`}
+            onClick={() => setShowLanPanel(!showLanPanel)}
+            title="Quét mạng LAN"
+          >
+            <span className="tool-icon">🔍</span>
+            <span className="tool-label">Quét LAN</span>
+          </button>
+          <button
+            className="tool-btn"
+            onClick={scanLan}
+            disabled={isScanning}
+            title="Bắt đầu quét"
+          >
+            <span className="tool-icon">{isScanning ? "⏳" : "📡"}</span>
+          </button>
+        </div>
+        <div className="toolbar-group">
+          <div className="toolbar-divider"></div>
+          <button
             className={`tool-btn ${viewMode === "grid" ? "active" : ""}`}
             onClick={() => setViewMode("grid")}
             title="Xem dạng lưới"
@@ -933,6 +1002,51 @@ function App() {
           </select>
         </div>
       </div>
+
+      {/* LAN Panel */}
+      {showLanPanel && (
+        <div className="lan-panel">
+          <div className="lan-header">
+            <h4>🌐 Thiết bị trong mạng LAN</h4>
+            <button onClick={() => setShowLanPanel(false)}>✕</button>
+          </div>
+          <div className="lan-wol">
+            <input
+              type="text"
+              placeholder="MAC Address (AA:BB:CC:DD:EE:FF)"
+              value={wolMac}
+              onChange={(e) => setWolMac(e.target.value)}
+            />
+            <button onClick={() => sendWol(wolMac)} disabled={!wolMac}>
+              ⚡ Wake-on-LAN
+            </button>
+          </div>
+          <div className="lan-hosts">
+            {isScanning && <div className="scanning">Đang quét mạng...</div>}
+            {lanHosts.length === 0 && !isScanning && (
+              <div className="no-hosts">Nhấn 📡 để quét mạng LAN</div>
+            )}
+            {lanHosts.map((host) => (
+              <div key={host.ip} className={`lan-host ${host.hasApp ? "has-app" : ""}`}>
+                <span className="host-icon">{host.hasApp ? "✅" : "💻"}</span>
+                <span className="host-ip">{host.ip}</span>
+                <span className="host-status">
+                  {host.hasApp ? "Có App" : "Online"}
+                </span>
+                {host.mac && (
+                  <button 
+                    className="wol-btn"
+                    onClick={() => sendWol(host.mac!)}
+                    title="Wake-on-LAN"
+                  >
+                    ⚡
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="main-content">
         {/* Sidebar */}

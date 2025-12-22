@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use rdev::{simulate, Button, EventType, Key, SimulateError};
 use scrap::{Capturer, Display};
 use std::io::ErrorKind::WouldBlock;
-use std::net::UdpSocket;
+use std::net::{UdpSocket, IpAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use std::thread;
@@ -236,6 +236,8 @@ fn start_h264_streaming(server_addr: String, fps: u32) -> Result<(), String> {
         println!("H.264 UDP streaming started to {} at {} FPS ({}x{})", 
                  server_addr, fps, STREAM_WIDTH, STREAM_HEIGHT);
         
+        let mut encode_errors = 0u32;
+        
         while STREAMING.load(Ordering::SeqCst) {
             let now = Instant::now();
             
@@ -246,9 +248,17 @@ fn start_h264_streaming(server_addr: String, fps: u32) -> Result<(), String> {
                     if send_h264_udp(&socket, &server_addr, &h264_data, sequence).is_ok() {
                         sequence = sequence.wrapping_add(1);
                         FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if sequence % 30 == 0 {
+                            println!("Sent {} H.264 frames ({} bytes)", sequence, h264_data.len());
+                        }
                     }
                     
                     *LAST_H264_FRAME.lock() = Some(h264_data);
+                } else {
+                    encode_errors += 1;
+                    if encode_errors % 30 == 1 {
+                        println!("H.264 encode failed (errors: {})", encode_errors);
+                    }
                 }
                 
                 // Also encode JPEG for preview/fallback
@@ -638,6 +648,157 @@ fn remote_key_press(key: String, code: String, ctrl: bool, alt: bool, shift: boo
     Ok(())
 }
 
+// ============== LAN Scan ==============
+#[tauri::command]
+async fn scan_lan(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    use std::net::{IpAddr, Ipv4Addr, TcpStream, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    
+    // Get local IP to determine subnet
+    let local_ip = local_ip_address::local_ip()
+        .map_err(|e| format!("Cannot get local IP: {}", e))?;
+    
+    let base_ip = match local_ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            format!("{}.{}.{}", octets[0], octets[1], octets[2])
+        }
+        _ => return Err("IPv6 not supported".to_string()),
+    };
+    
+    println!("Scanning LAN: {}.1-254", base_ip);
+    let _ = app.emit("scan-progress", serde_json::json!({ "status": "scanning", "base": base_ip }));
+    
+    let found_hosts: Arc<parking_lot::Mutex<Vec<serde_json::Value>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let scanned = Arc::new(AtomicUsize::new(0));
+    
+    let mut handles = vec![];
+    
+    for i in 1..=254u8 {
+        let ip_str = format!("{}.{}", base_ip, i);
+        let found = Arc::clone(&found_hosts);
+        let count = Arc::clone(&scanned);
+        
+        let handle = thread::spawn(move || {
+            let ip: Ipv4Addr = ip_str.parse().unwrap();
+            let addr = SocketAddr::new(IpAddr::V4(ip), 3001); // Check if our app port is open
+            
+            // Quick TCP connect check with timeout
+            let is_online = TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok();
+            
+            // Also try ping-like check (any common port)
+            let has_any_service = if !is_online {
+                // Try common ports: 22 (SSH), 445 (SMB), 139 (NetBIOS)
+                [22, 445, 139, 80, 443].iter().any(|&port| {
+                    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+                    TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok()
+                })
+            } else {
+                true
+            };
+            
+            count.fetch_add(1, Ordering::Relaxed);
+            
+            if is_online || has_any_service {
+                let mut hosts = found.lock();
+                hosts.push(serde_json::json!({
+                    "ip": ip_str,
+                    "hasApp": is_online,
+                    "online": true
+                }));
+            }
+        });
+        
+        handles.push(handle);
+        
+        // Limit concurrent threads
+        if handles.len() >= 50 {
+            if let Some(h) = handles.pop() {
+                let _ = h.join();
+            }
+        }
+    }
+    
+    // Wait for all threads
+    for h in handles {
+        let _ = h.join();
+    }
+    
+    let results = found_hosts.lock().clone();
+    println!("Scan complete: {} hosts found", results.len());
+    let _ = app.emit("scan-progress", serde_json::json!({ "status": "complete", "count": results.len() }));
+    
+    Ok(results)
+}
+
+// ============== Wake-on-LAN ==============
+#[tauri::command]
+fn wake_on_lan(mac_address: String) -> Result<String, String> {
+    // Parse MAC address (formats: AA:BB:CC:DD:EE:FF or AA-BB-CC-DD-EE-FF)
+    let mac_str = mac_address.replace("-", ":").to_uppercase();
+    let mac_bytes: Vec<u8> = mac_str
+        .split(':')
+        .map(|s| u8::from_str_radix(s, 16))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| format!("Invalid MAC address: {}", mac_address))?;
+    
+    if mac_bytes.len() != 6 {
+        return Err(format!("MAC address must have 6 bytes, got {}", mac_bytes.len()));
+    }
+    
+    // Build magic packet: 6 bytes of 0xFF + MAC repeated 16 times
+    let mut magic_packet = vec![0xFFu8; 6];
+    for _ in 0..16 {
+        magic_packet.extend_from_slice(&mac_bytes);
+    }
+    
+    // Send to broadcast address on port 9 (standard WOL port)
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| format!("Cannot create socket: {}", e))?;
+    
+    socket.set_broadcast(true)
+        .map_err(|e| format!("Cannot enable broadcast: {}", e))?;
+    
+    // Send to multiple broadcast addresses for better compatibility
+    let broadcasts = ["255.255.255.255:9", "255.255.255.255:7"];
+    
+    for addr in broadcasts {
+        if let Err(e) = socket.send_to(&magic_packet, addr) {
+            println!("WOL send to {} failed: {}", addr, e);
+        }
+    }
+    
+    // Also try subnet broadcast
+    if let Ok(local_ip) = local_ip_address::local_ip() {
+        if let IpAddr::V4(ip) = local_ip {
+            let octets = ip.octets();
+            let subnet_broadcast = format!("{}.{}.{}.255:9", octets[0], octets[1], octets[2]);
+            let _ = socket.send_to(&magic_packet, &subnet_broadcast);
+        }
+    }
+    
+    println!("WOL packet sent to {}", mac_address);
+    Ok(format!("Wake-on-LAN packet sent to {}", mac_address))
+}
+
+// ============== Get Local Network Info ==============
+#[tauri::command]
+fn get_network_info() -> Result<serde_json::Value, String> {
+    let local_ip = local_ip_address::local_ip()
+        .map_err(|e| format!("Cannot get local IP: {}", e))?;
+    
+    let mac = mac_address::get_mac_address()
+        .map_err(|e| format!("Cannot get MAC: {}", e))?
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    
+    Ok(serde_json::json!({
+        "ip": local_ip.to_string(),
+        "mac": mac
+    }))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -657,7 +818,10 @@ pub fn run() {
             remote_mouse_move,
             remote_mouse_click,
             remote_mouse_scroll,
-            remote_key_press
+            remote_key_press,
+            scan_lan,
+            wake_on_lan,
+            get_network_info
         ])
         .setup(|_app| {
             #[cfg(debug_assertions)]
