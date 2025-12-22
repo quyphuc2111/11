@@ -49,6 +49,22 @@ function App() {
   const [wolMac, setWolMac] = useState("");
   const [showLanPanel, setShowLanPanel] = useState(false);
 
+  // File Transfer states
+  const [showFilePanel, setShowFilePanel] = useState(false);
+  const [fileTransfers, setFileTransfers] = useState<Map<string, {
+    transferId: string;
+    fileName: string;
+    fileSize: number;
+    totalChunks: number;
+    sentChunks: number;
+    clientProgress: Map<string, number>;
+    status: 'preparing' | 'sending' | 'complete' | 'error';
+    mode: 'socketio' | 'tcp';
+    bytesTransferred?: number;
+  }>>(new Map());
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [transferMode, setTransferMode] = useState<'tcp' | 'socketio'>('tcp'); // Default to TCP
+
   const addLog = (msg: string) => {
     const time = new Date().toLocaleTimeString();
     setDebugLogs((prev) => [...prev.slice(-20), `[${time}] ${msg}`]);
@@ -97,6 +113,379 @@ function App() {
       addLog(`WOL error: ${e.message || e}`);
     }
   };
+
+  // File Transfer functions
+  const sendFileToClients = async (file: File, clientIds: string[]) => {
+    if (!isTauri || !socket) {
+      addLog("File transfer requires Tauri app and socket connection");
+      return;
+    }
+
+    // Use TCP mode for single client, Socket.IO for multiple
+    if (transferMode === 'tcp' && clientIds.length === 1) {
+      await sendFileTcp(file, clientIds[0]);
+      return;
+    }
+
+    // Socket.IO mode (original implementation)
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      
+      // If no file provided, open file picker
+      let filePath = "";
+      if (!file) {
+        const selected = await open({
+          multiple: false,
+          title: "Chọn file để gửi"
+        });
+        if (!selected) return;
+        filePath = selected as string;
+      }
+
+      addLog(`Preparing file transfer: ${filePath || file.name}`);
+
+      // Prepare file metadata
+      const metadata = await invoke<{
+        transfer_id: string;
+        file_name: string;
+        file_path: string;
+        file_size: number;
+        total_chunks: number;
+        file_hash: string;
+      }>("prepare_file_transfer", { filePath: filePath || file.name });
+
+      addLog(`File ready: ${metadata.file_name} (${metadata.total_chunks} chunks)`);
+
+      // Track transfer
+      setFileTransfers(prev => {
+        const newMap = new Map(prev);
+        newMap.set(metadata.transfer_id, {
+          transferId: metadata.transfer_id,
+          fileName: metadata.file_name,
+          fileSize: metadata.file_size,
+          totalChunks: metadata.total_chunks,
+          sentChunks: 0,
+          clientProgress: new Map(clientIds.map(id => [id, 0])),
+          status: 'preparing',
+          mode: 'socketio'
+        });
+        return newMap;
+      });
+
+      // Send metadata to clients via Socket.IO
+      socket.emit("file-transfer-start", {
+        clientIds,
+        metadata: {
+          transfer_id: metadata.transfer_id,
+          file_name: metadata.file_name,
+          file_size: metadata.file_size,
+          total_chunks: metadata.total_chunks,
+          file_hash: metadata.file_hash
+        }
+      });
+
+      // Wait a bit for clients to initialize
+      await new Promise(r => setTimeout(r, 500));
+
+      // Send chunks
+      setFileTransfers(prev => {
+        const newMap = new Map(prev);
+        const transfer = newMap.get(metadata.transfer_id);
+        if (transfer) {
+          transfer.status = 'sending';
+          newMap.set(metadata.transfer_id, transfer);
+        }
+        return newMap;
+      });
+
+      for (let i = 0; i < metadata.total_chunks; i++) {
+        const chunk = await invoke<{
+          chunk_index: number;
+          data: string;
+          size: number;
+        }>("read_file_chunk", { 
+          filePath: metadata.file_path, 
+          chunkIndex: i 
+        });
+
+        // Send to each client
+        for (const clientId of clientIds) {
+          socket.emit("file-chunk", {
+            clientId,
+            transferId: metadata.transfer_id,
+            chunkIndex: chunk.chunk_index,
+            data: chunk.data
+          });
+        }
+
+        // Update progress
+        setFileTransfers(prev => {
+          const newMap = new Map(prev);
+          const transfer = newMap.get(metadata.transfer_id);
+          if (transfer) {
+            transfer.sentChunks = i + 1;
+            newMap.set(metadata.transfer_id, transfer);
+          }
+          return newMap;
+        });
+
+        // Small delay to prevent overwhelming
+        if (i % 10 === 0) {
+          await new Promise(r => setTimeout(r, 10));
+        }
+      }
+
+      addLog(`File sent: ${metadata.file_name}`);
+
+    } catch (e: any) {
+      addLog(`File transfer error: ${e.message || e}`);
+    }
+  };
+
+  // Direct TCP file transfer (faster)
+  const sendFileTcp = async (file: File, clientId: string) => {
+    if (!isTauri || !socket) return;
+
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      
+      let filePath = "";
+      if (!file || !(file as any).name?.includes('/')) {
+        const selected = await open({
+          multiple: false,
+          title: "Chọn file để gửi (TCP)"
+        });
+        if (!selected) return;
+        filePath = selected as string;
+      } else {
+        filePath = (file as any).name;
+      }
+
+      addLog(`[TCP] Preparing file: ${filePath}`);
+
+      // Prepare file metadata
+      const metadata = await invoke<{
+        transfer_id: string;
+        file_name: string;
+        file_path: string;
+        file_size: number;
+        total_chunks: number;
+        file_hash: string;
+      }>("prepare_file_transfer", { filePath });
+
+      addLog(`[TCP] File ready: ${metadata.file_name} (${metadata.file_size} bytes)`);
+
+      // Track transfer
+      setFileTransfers(prev => {
+        const newMap = new Map(prev);
+        newMap.set(metadata.transfer_id, {
+          transferId: metadata.transfer_id,
+          fileName: metadata.file_name,
+          fileSize: metadata.file_size,
+          totalChunks: metadata.total_chunks,
+          sentChunks: 0,
+          clientProgress: new Map([[clientId, 0]]),
+          status: 'preparing',
+          mode: 'tcp',
+          bytesTransferred: 0
+        });
+        return newMap;
+      });
+
+      // Send TCP transfer request via Socket.IO signaling
+      socket.emit("tcp-transfer-request", {
+        clientId,
+        metadata: {
+          transfer_id: metadata.transfer_id,
+          file_name: metadata.file_name,
+          file_path: metadata.file_path,
+          file_size: metadata.file_size,
+          file_hash: metadata.file_hash
+        }
+      });
+
+      addLog(`[TCP] Waiting for client to start TCP server...`);
+
+    } catch (e: any) {
+      addLog(`[TCP] Error: ${e.message || e}`);
+    }
+  };
+
+  // Handle file transfer events from clients
+  useEffect(() => {
+    if (!socket || role !== "admin") return;
+
+    socket.on("file-transfer-progress", ({ clientId, transferId, progress }: { clientId: string; transferId: string; progress: number }) => {
+      setFileTransfers(prev => {
+        const newMap = new Map(prev);
+        const transfer = newMap.get(transferId);
+        if (transfer) {
+          transfer.clientProgress.set(clientId, progress);
+          newMap.set(transferId, transfer);
+        }
+        return newMap;
+      });
+    });
+
+    socket.on("file-transfer-complete", ({ clientId, transferId }: { clientId: string; transferId: string }) => {
+      addLog(`Client ${clientId} received file (${transferId})`);
+      setFileTransfers(prev => {
+        const newMap = new Map(prev);
+        const transfer = newMap.get(transferId);
+        if (transfer) {
+          transfer.clientProgress.set(clientId, 100);
+          // Check if all clients complete
+          const allComplete = Array.from(transfer.clientProgress.values()).every(p => p === 100);
+          if (allComplete) {
+            transfer.status = 'complete';
+          }
+          newMap.set(transferId, transfer);
+        }
+        return newMap;
+      });
+    });
+
+    socket.on("file-transfer-error", ({ clientId, error }: { clientId: string; transferId: string; error: string }) => {
+      addLog(`File transfer error from ${clientId}: ${error}`);
+    });
+
+    // TCP Transfer events (Admin side)
+    socket.on("tcp-ready-to-receive", async ({ clientId, clientIp, transferId, port }: { 
+      clientId: string; clientIp: string; transferId: string; port: number 
+    }) => {
+      addLog(`[TCP] Client ${clientId} ready on ${clientIp}:${port}`);
+      
+      // Find the transfer and start sending
+      const transfer = fileTransfers.get(transferId);
+      if (!transfer || !isTauri) return;
+
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const { listen } = await import("@tauri-apps/api/event");
+
+        // Listen for send progress
+        const unlistenProgress = await listen<{ transfer_id: string; bytes_transferred: number; total_bytes: number; progress: number }>(
+          "tcp-send-progress",
+          (event) => {
+            const { transfer_id, bytes_transferred, progress } = event.payload;
+            setFileTransfers(prev => {
+              const newMap = new Map(prev);
+              const t = newMap.get(transfer_id);
+              if (t) {
+                t.bytesTransferred = bytes_transferred;
+                t.clientProgress.set(clientId, progress);
+                t.status = 'sending';
+                newMap.set(transfer_id, t);
+              }
+              return newMap;
+            });
+          }
+        );
+
+        // Listen for send complete
+        const unlistenComplete = await listen<{ transfer_id: string }>(
+          "tcp-send-complete",
+          (event) => {
+            addLog(`[TCP] Send complete: ${event.payload.transfer_id}`);
+            unlistenProgress();
+            unlistenComplete();
+          }
+        );
+
+        // Listen for send error
+        const unlistenError = await listen<{ transfer_id: string; error: string }>(
+          "tcp-send-error",
+          (event) => {
+            addLog(`[TCP] Send error: ${event.payload.error}`);
+            setFileTransfers(prev => {
+              const newMap = new Map(prev);
+              const t = newMap.get(event.payload.transfer_id);
+              if (t) {
+                t.status = 'error';
+                newMap.set(event.payload.transfer_id, t);
+              }
+              return newMap;
+            });
+            unlistenProgress();
+            unlistenComplete();
+            unlistenError();
+          }
+        );
+
+        // Start TCP send
+        setFileTransfers(prev => {
+          const newMap = new Map(prev);
+          const t = newMap.get(transferId);
+          if (t) {
+            t.status = 'sending';
+            newMap.set(transferId, t);
+          }
+          return newMap;
+        });
+
+        // Get file path from metadata (stored when preparing)
+        const filePath = (transfer as any).filePath || selectedFile?.name;
+        
+        await invoke("send_file_tcp", {
+          transferId,
+          filePath,
+          clientIp,
+          clientPort: port,
+          resumeOffset: 0
+        });
+
+        addLog(`[TCP] Started sending to ${clientIp}:${port}`);
+
+      } catch (e: any) {
+        addLog(`[TCP] Send error: ${e.message || e}`);
+      }
+    });
+
+    socket.on("tcp-transfer-progress", ({ clientId, transferId, progress, bytesTransferred }: {
+      clientId: string; transferId: string; progress: number; bytesTransferred: number;
+    }) => {
+      setFileTransfers(prev => {
+        const newMap = new Map(prev);
+        const transfer = newMap.get(transferId);
+        if (transfer) {
+          transfer.clientProgress.set(clientId, progress);
+          transfer.bytesTransferred = bytesTransferred;
+          newMap.set(transferId, transfer);
+        }
+        return newMap;
+      });
+    });
+
+    socket.on("tcp-transfer-complete", ({ clientId, transferId }: { clientId: string; transferId: string }) => {
+      addLog(`[TCP] Client ${clientId} received file complete`);
+      setFileTransfers(prev => {
+        const newMap = new Map(prev);
+        const transfer = newMap.get(transferId);
+        if (transfer) {
+          transfer.clientProgress.set(clientId, 100);
+          transfer.status = 'complete';
+          newMap.set(transferId, transfer);
+        }
+        return newMap;
+      });
+    });
+
+    socket.on("tcp-transfer-error", ({ clientId, error }: { clientId: string; error: string }) => {
+      addLog(`[TCP] Error from ${clientId}: ${error}`);
+    });
+
+    return () => {
+      socket.off("file-transfer-progress");
+      socket.off("file-transfer-complete");
+      socket.off("file-transfer-error");
+      socket.off("tcp-ready-to-receive");
+      socket.off("tcp-transfer-progress");
+      socket.off("tcp-transfer-complete");
+      socket.off("tcp-transfer-error");
+    };
+  }, [socket, role, fileTransfers, selectedFile]);
 
   const handleLogin = () => {
     const user = USERS[username as keyof typeof USERS];
@@ -656,6 +1045,173 @@ function App() {
           socket.emit("screen-size-response", { width: window.screen.width, height: window.screen.height });
         }
       });
+
+      // ============== File Transfer Receive (Client) ==============
+      socket.on("file-transfer-metadata", async (metadata: {
+        transfer_id: string;
+        file_name: string;
+        file_size: number;
+        total_chunks: number;
+        file_hash: string;
+      }) => {
+        addLog(`Receiving file: ${metadata.file_name} (${metadata.total_chunks} chunks)`);
+        
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            const { downloadDir } = await import("@tauri-apps/api/path");
+            
+            const saveDir = await downloadDir();
+            const result = await invoke("init_file_receive", {
+              transferId: metadata.transfer_id,
+              fileName: metadata.file_name,
+              fileSize: metadata.file_size,
+              totalChunks: metadata.total_chunks,
+              fileHash: metadata.file_hash,
+              saveDir
+            });
+            
+            addLog(`File receive initialized, resume from chunk ${(result as any).resume_from}`);
+          } catch (e: any) {
+            addLog(`File receive init error: ${e.message || e}`);
+            socket.emit("file-transfer-error", { 
+              transferId: metadata.transfer_id, 
+              error: e.message || e 
+            });
+          }
+        }
+      });
+
+      socket.on("file-chunk", async (chunk: {
+        transferId: string;
+        chunkIndex: number;
+        data: string;
+      }) => {
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            
+            const result = await invoke<{ progress: number }>("receive_file_chunk", {
+              transferId: chunk.transferId,
+              chunkIndex: chunk.chunkIndex,
+              data: chunk.data
+            });
+            
+            // Report progress every 10%
+            if (result.progress % 10 === 0) {
+              socket.emit("file-transfer-progress", {
+                transferId: chunk.transferId,
+                progress: result.progress
+              });
+              addLog(`File progress: ${result.progress}%`);
+            }
+            
+            // Check if complete
+            if (result.progress === 100) {
+              const { downloadDir } = await import("@tauri-apps/api/path");
+              const saveDir = await downloadDir();
+              
+              const finalResult = await invoke("finalize_file_transfer", {
+                transferId: chunk.transferId,
+                saveDir
+              });
+              
+              addLog(`File saved: ${(finalResult as any).file_path}`);
+              socket.emit("file-transfer-complete", { transferId: chunk.transferId });
+            }
+          } catch (e: any) {
+            // Silent fail for individual chunks, will retry
+          }
+        }
+      });
+
+      // ============== Direct TCP File Transfer (Client) ==============
+      socket.on("tcp-transfer-request", async (request: {
+        adminId: string;
+        transfer_id: string;
+        file_name: string;
+        file_path: string;
+        file_size: number;
+        file_hash: string;
+      }) => {
+        addLog(`[TCP] Transfer request: ${request.file_name} (${request.file_size} bytes)`);
+        
+        if (isTauri) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            const { downloadDir } = await import("@tauri-apps/api/path");
+            const { listen } = await import("@tauri-apps/api/event");
+            
+            const saveDir = await downloadDir();
+            
+            // Listen for TCP transfer events
+            const unlistenProgress = await listen<{ transfer_id: string; bytes_transferred: number; total_bytes: number; progress: number }>(
+              "tcp-transfer-progress",
+              (event) => {
+                const { transfer_id, progress, bytes_transferred } = event.payload;
+                socket.emit("tcp-transfer-progress", {
+                  transferId: transfer_id,
+                  progress,
+                  bytesTransferred: bytes_transferred
+                });
+                if (progress % 10 === 0) {
+                  addLog(`[TCP] Progress: ${progress}%`);
+                }
+              }
+            );
+
+            const unlistenComplete = await listen<{ transfer_id: string; file_name: string; file_path: string }>(
+              "tcp-transfer-complete",
+              (event) => {
+                addLog(`[TCP] File saved: ${event.payload.file_path}`);
+                socket.emit("tcp-transfer-complete", { transferId: event.payload.transfer_id });
+                unlistenProgress();
+                unlistenComplete();
+                unlistenError();
+              }
+            );
+
+            const unlistenError = await listen<{ transfer_id: string; error: string }>(
+              "tcp-transfer-error",
+              (event) => {
+                addLog(`[TCP] Error: ${event.payload.error}`);
+                socket.emit("tcp-transfer-error", { 
+                  transferId: event.payload.transfer_id,
+                  error: event.payload.error
+                });
+                unlistenProgress();
+                unlistenComplete();
+                unlistenError();
+              }
+            );
+
+            // Start TCP server
+            const port = await invoke<number>("start_tcp_file_server", {
+              transferId: request.transfer_id,
+              fileName: request.file_name,
+              fileSize: request.file_size,
+              fileHash: request.file_hash,
+              saveDir
+            });
+            
+            addLog(`[TCP] Server started on port ${port}`);
+            
+            // Signal admin that we're ready
+            socket.emit("tcp-ready-to-receive", {
+              adminId: request.adminId,
+              transferId: request.transfer_id,
+              port
+            });
+            
+          } catch (e: any) {
+            addLog(`[TCP] Error: ${e.message || e}`);
+            socket.emit("tcp-transfer-error", {
+              transferId: request.transfer_id,
+              error: e.message || e
+            });
+          }
+        }
+      });
     }
 
     socket.connect();
@@ -973,6 +1529,15 @@ function App() {
           >
             <span className="tool-icon">{isScanning ? "⏳" : "📡"}</span>
           </button>
+          <div className="toolbar-divider"></div>
+          <button
+            className={`tool-btn ${showFilePanel ? "active" : ""}`}
+            onClick={() => setShowFilePanel(!showFilePanel)}
+            title="Gửi file"
+          >
+            <span className="tool-icon">📁</span>
+            <span className="tool-label">Gửi file</span>
+          </button>
         </div>
         <div className="toolbar-group">
           <div className="toolbar-divider"></div>
@@ -1044,6 +1609,117 @@ function App() {
                 )}
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* File Transfer Panel */}
+      {showFilePanel && (
+        <div className="file-panel">
+          <div className="file-header">
+            <h4>📁 Gửi file đến máy trạm</h4>
+            <button onClick={() => setShowFilePanel(false)}>✕</button>
+          </div>
+          <div className="file-mode">
+            <label>
+              <input 
+                type="radio" 
+                name="transferMode" 
+                checked={transferMode === 'tcp'} 
+                onChange={() => setTransferMode('tcp')}
+              />
+              TCP trực tiếp (nhanh)
+            </label>
+            <label>
+              <input 
+                type="radio" 
+                name="transferMode" 
+                checked={transferMode === 'socketio'} 
+                onChange={() => setTransferMode('socketio')}
+              />
+              Socket.IO (nhiều máy)
+            </label>
+          </div>
+          <div className="file-select">
+            <button 
+              className="select-file-btn"
+              onClick={async () => {
+                if (isTauri) {
+                  const { open } = await import("@tauri-apps/plugin-dialog");
+                  const selected = await open({ multiple: false, title: "Chọn file" });
+                  if (selected) {
+                    setSelectedFile({ name: selected as string } as any);
+                  }
+                }
+              }}
+            >
+              📂 Chọn file
+            </button>
+            {selectedFile && <span className="selected-name">{selectedFile.name}</span>}
+          </div>
+          <div className="file-targets">
+            <div className="target-header">Gửi đến:</div>
+            <div className="target-options">
+              {transferMode === 'socketio' && (
+                <button 
+                  className="target-btn"
+                  onClick={() => {
+                    const allIds = Array.from(clients.keys());
+                    if (selectedFile && allIds.length > 0) {
+                      sendFileToClients(selectedFile, allIds);
+                    }
+                  }}
+                  disabled={!selectedFile || clients.size === 0}
+                >
+                  📤 Tất cả ({clients.size} máy)
+                </button>
+              )}
+              <button 
+                className="target-btn"
+                onClick={() => {
+                  if (selectedFile && selectedClient) {
+                    sendFileToClients(selectedFile, [selectedClient]);
+                  }
+                }}
+                disabled={!selectedFile || !selectedClient}
+              >
+                📤 Máy đã chọn {transferMode === 'tcp' ? '(TCP)' : ''}
+              </button>
+            </div>
+          </div>
+          <div className="file-transfers-list">
+            <div className="transfers-header">Đang truyền:</div>
+            {Array.from(fileTransfers.values()).map(transfer => (
+              <div key={transfer.transferId} className={`transfer-item ${transfer.status}`}>
+                <div className="transfer-name">
+                  {transfer.fileName}
+                  <span className="transfer-mode-badge">{transfer.mode === 'tcp' ? '⚡TCP' : '📡SIO'}</span>
+                </div>
+                <div className="transfer-progress">
+                  <div 
+                    className="progress-bar" 
+                    style={{ 
+                      width: transfer.mode === 'tcp' 
+                        ? `${(transfer.bytesTransferred || 0) / transfer.fileSize * 100}%`
+                        : `${(transfer.sentChunks / transfer.totalChunks) * 100}%` 
+                    }}
+                  />
+                </div>
+                <div className="transfer-status">
+                  {transfer.status === 'sending' && (
+                    transfer.mode === 'tcp' 
+                      ? `${Math.round((transfer.bytesTransferred || 0) / transfer.fileSize * 100)}%`
+                      : `${Math.round((transfer.sentChunks / transfer.totalChunks) * 100)}%`
+                  )}
+                  {transfer.status === 'preparing' && '⏳ Chuẩn bị...'}
+                  {transfer.status === 'complete' && '✅ Hoàn thành'}
+                  {transfer.status === 'error' && '❌ Lỗi'}
+                </div>
+              </div>
+            ))}
+            {fileTransfers.size === 0 && (
+              <div className="no-transfers">Chưa có file nào đang truyền</div>
+            )}
           </div>
         </div>
       )}

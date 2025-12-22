@@ -143,6 +143,125 @@ io.on("connection", (socket) => {
     });
   });
 
+  // ============== File Transfer Events ==============
+  
+  // Admin sends file metadata to specific client(s)
+  socket.on("file-transfer-start", ({ clientIds, metadata }) => {
+    console.log(`File transfer start: ${metadata.file_name} to ${clientIds.length} clients`);
+    clientIds.forEach(clientId => {
+      if (clients.has(clientId)) {
+        io.to(clientId).emit("file-transfer-metadata", metadata);
+      }
+    });
+  });
+
+  // Admin sends file chunk to specific client
+  socket.on("file-chunk", ({ clientId, transferId, chunkIndex, data }) => {
+    if (clients.has(clientId)) {
+      io.to(clientId).emit("file-chunk", { transferId, chunkIndex, data });
+    }
+  });
+
+  // Client requests resume info
+  socket.on("file-transfer-resume-request", ({ transferId }) => {
+    // Forward to admin
+    admins.forEach((_, adminId) => {
+      io.to(adminId).emit("file-transfer-resume-request", { 
+        clientId: socket.id, 
+        transferId 
+      });
+    });
+  });
+
+  // Client sends progress update
+  socket.on("file-transfer-progress", (data) => {
+    admins.forEach((_, adminId) => {
+      io.to(adminId).emit("file-transfer-progress", { 
+        clientId: socket.id, 
+        ...data 
+      });
+    });
+  });
+
+  // Client confirms transfer complete
+  socket.on("file-transfer-complete", (data) => {
+    console.log(`File transfer complete: ${data.transferId} on ${socket.id}`);
+    admins.forEach((_, adminId) => {
+      io.to(adminId).emit("file-transfer-complete", { 
+        clientId: socket.id, 
+        ...data 
+      });
+    });
+  });
+
+  // Client reports error
+  socket.on("file-transfer-error", (data) => {
+    console.log(`File transfer error: ${data.transferId} - ${data.error}`);
+    admins.forEach((_, adminId) => {
+      io.to(adminId).emit("file-transfer-error", { 
+        clientId: socket.id, 
+        ...data 
+      });
+    });
+  });
+
+  // ============== Direct TCP File Transfer Signaling ==============
+  
+  // Admin requests TCP transfer to client
+  socket.on("tcp-transfer-request", ({ clientId, metadata }) => {
+    console.log(`TCP transfer request: ${metadata.file_name} to ${clientId}`);
+    if (clients.has(clientId)) {
+      io.to(clientId).emit("tcp-transfer-request", {
+        adminId: socket.id,
+        ...metadata
+      });
+    }
+  });
+
+  // Client signals ready to receive (TCP server started)
+  socket.on("tcp-ready-to-receive", ({ adminId, transferId, port }) => {
+    const client = clients.get(socket.id);
+    console.log(`Client ${socket.id} ready for TCP on port ${port}`);
+    io.to(adminId).emit("tcp-ready-to-receive", {
+      clientId: socket.id,
+      clientIp: client?.ip || getClientIp(socket),
+      transferId,
+      port
+    });
+  });
+
+  // Client reports TCP transfer progress
+  socket.on("tcp-transfer-progress", (data) => {
+    admins.forEach((_, adminId) => {
+      io.to(adminId).emit("tcp-transfer-progress", {
+        clientId: socket.id,
+        ...data
+      });
+    });
+  });
+
+  // Client reports TCP transfer complete
+  socket.on("tcp-transfer-complete", (data) => {
+    console.log(`TCP transfer complete: ${data.transferId}`);
+    admins.forEach((_, adminId) => {
+      io.to(adminId).emit("tcp-transfer-complete", {
+        clientId: socket.id,
+        ...data
+      });
+    });
+  });
+
+  // Client reports TCP transfer error
+  socket.on("tcp-transfer-error", (data) => {
+    console.log(`TCP transfer error: ${data.error}`);
+    admins.forEach((_, adminId) => {
+      io.to(adminId).emit("tcp-transfer-error", {
+        clientId: socket.id,
+        ...data
+      });
+    });
+  });
+
   socket.on("disconnect", () => {
     console.log("Disconnected:", socket.id);
     if (admins.has(socket.id)) admins.delete(socket.id);

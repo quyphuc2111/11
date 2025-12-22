@@ -937,3 +937,214 @@ body {
 .scanning {
   color: #89b4fa;
 }
+
+
+/* ========== FILE TRANSFER PANEL ========== */
+.file-panel {
+  position: absolute;
+  top: 50px;
+  right: 370px;
+  width: 350px;
+  max-height: 500px;
+  background: #313244;
+  border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  z-index: 1000;
+  overflow: hidden;
+}
+
+.file-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: #45475a;
+  border-bottom: 1px solid #585b70;
+}
+
+.file-header h4 {
+  margin: 0;
+  font-size: 14px;
+  color: #cdd6f4;
+}
+
+.file-header button {
+  background: none;
+  border: none;
+  color: #cdd6f4;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.file-header button:hover {
+  background: #585b70;
+}
+
+.file-mode {
+  padding: 10px 12px;
+  border-bottom: 1px solid #45475a;
+  display: flex;
+  gap: 16px;
+  background: #3b3d4f;
+}
+
+.file-mode label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #cdd6f4;
+  cursor: pointer;
+}
+
+.file-mode input[type="radio"] {
+  accent-color: #89b4fa;
+}
+
+.file-select {
+  padding: 12px;
+  border-bottom: 1px solid #45475a;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.select-file-btn {
+  padding: 10px 16px;
+  background: #89b4fa;
+  color: #1e1e2e;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.select-file-btn:hover {
+  background: #74a8f7;
+}
+
+.selected-name {
+  flex: 1;
+  font-size: 12px;
+  color: #a6adc8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-targets {
+  padding: 12px;
+  border-bottom: 1px solid #45475a;
+}
+
+.target-header {
+  font-size: 12px;
+  color: #6c7086;
+  margin-bottom: 8px;
+}
+
+.target-options {
+  display: flex;
+  gap: 8px;
+}
+
+.target-btn {
+  flex: 1;
+  padding: 10px;
+  background: #a6e3a1;
+  color: #1e1e2e;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.target-btn:hover {
+  background: #94d990;
+}
+
+.target-btn:disabled {
+  background: #45475a;
+  color: #6c7086;
+  cursor: not-allowed;
+}
+
+.file-transfers-list {
+  padding: 12px;
+  max-height: 250px;
+  overflow-y: auto;
+}
+
+.transfers-header {
+  font-size: 12px;
+  color: #6c7086;
+  margin-bottom: 8px;
+}
+
+.transfer-item {
+  background: #1e1e2e;
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+
+.transfer-item.complete {
+  border: 1px solid #a6e3a1;
+}
+
+.transfer-item.error {
+  border: 1px solid #f38ba8;
+}
+
+.transfer-name {
+  font-size: 13px;
+  color: #cdd6f4;
+  margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.transfer-mode-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #89b4fa;
+  color: #1e1e2e;
+  font-weight: 600;
+}
+
+.transfer-progress {
+  height: 6px;
+  background: #45475a;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #89b4fa, #a6e3a1);
+  border-radius: 3px;
+  transition: width 0.2s ease;
+}
+
+.transfer-status {
+  font-size: 11px;
+  color: #a6adc8;
+  text-align: right;
+}
+
+.no-transfers {
+  text-align: center;
+  padding: 20px;
+  color: #6c7086;
+  font-size: 13px;
+}

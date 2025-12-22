@@ -799,11 +799,623 @@ fn get_network_info() -> Result<serde_json::Value, String> {
     }))
 }
 
+// ============== File Transfer with Chunk + Resume ==============
+use sha2::{Sha256, Digest};
+use std::fs::{self, File};
+use std::io::{Read, Write, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::collections::HashMap;
+
+const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+
+lazy_static::lazy_static! {
+    // Track ongoing transfers: transfer_id -> TransferState
+    static ref TRANSFERS: Mutex<HashMap<String, TransferState>> = Mutex::new(HashMap::new());
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TransferState {
+    file_name: String,
+    file_size: u64,
+    total_chunks: u32,
+    received_chunks: u32,
+    file_hash: String,
+    temp_path: String,
+    completed: bool,
+}
+
+// Admin: Read file and prepare for transfer
+#[tauri::command]
+fn prepare_file_transfer(file_path: String) -> Result<serde_json::Value, String> {
+    let path = PathBuf::from(&file_path);
+    
+    if !path.exists() {
+        return Err(format!("File not found: {}", file_path));
+    }
+    
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    let file_size = metadata.len();
+    let file_name = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    
+    // Calculate file hash
+    let mut file = File::open(&path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    
+    loop {
+        let bytes_read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if bytes_read == 0 { break; }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    
+    let file_hash = hex::encode(hasher.finalize());
+    let total_chunks = ((file_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+    let transfer_id = format!("{}_{}", file_hash[..16].to_string(), chrono_lite_timestamp());
+    
+    Ok(serde_json::json!({
+        "transfer_id": transfer_id,
+        "file_name": file_name,
+        "file_path": file_path,
+        "file_size": file_size,
+        "total_chunks": total_chunks,
+        "file_hash": file_hash,
+        "chunk_size": CHUNK_SIZE
+    }))
+}
+
+fn chrono_lite_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// Admin: Read a specific chunk from file
+#[tauri::command]
+fn read_file_chunk(file_path: String, chunk_index: u32) -> Result<serde_json::Value, String> {
+    let mut file = File::open(&file_path).map_err(|e| e.to_string())?;
+    let offset = chunk_index as u64 * CHUNK_SIZE as u64;
+    
+    file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let bytes_read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+    buffer.truncate(bytes_read);
+    
+    let data_base64 = general_purpose::STANDARD.encode(&buffer);
+    
+    Ok(serde_json::json!({
+        "chunk_index": chunk_index,
+        "data": data_base64,
+        "size": bytes_read
+    }))
+}
+
+// Client: Initialize file receive
+#[tauri::command]
+fn init_file_receive(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    file_name: String,
+    file_size: u64,
+    total_chunks: u32,
+    file_hash: String,
+    save_dir: String
+) -> Result<serde_json::Value, String> {
+    let save_path = PathBuf::from(&save_dir);
+    if !save_path.exists() {
+        fs::create_dir_all(&save_path).map_err(|e| e.to_string())?;
+    }
+    
+    let temp_path = save_path.join(format!("{}.tmp", transfer_id));
+    
+    // Check if we have partial transfer (for resume)
+    let received_chunks = if temp_path.exists() {
+        let existing_size = fs::metadata(&temp_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        (existing_size / CHUNK_SIZE as u64) as u32
+    } else {
+        // Create empty temp file
+        File::create(&temp_path).map_err(|e| e.to_string())?;
+        0
+    };
+    
+    let state = TransferState {
+        file_name: file_name.clone(),
+        file_size,
+        total_chunks,
+        received_chunks,
+        file_hash,
+        temp_path: temp_path.to_string_lossy().to_string(),
+        completed: false,
+    };
+    
+    TRANSFERS.lock().insert(transfer_id.clone(), state.clone());
+    
+    let _ = app.emit("file-transfer-init", serde_json::json!({
+        "transfer_id": transfer_id,
+        "file_name": file_name,
+        "resume_from": received_chunks
+    }));
+    
+    Ok(serde_json::json!({
+        "transfer_id": transfer_id,
+        "resume_from": received_chunks,
+        "status": "ready"
+    }))
+}
+
+// Client: Receive and save a chunk
+#[tauri::command]
+fn receive_file_chunk(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    chunk_index: u32,
+    data: String // base64
+) -> Result<serde_json::Value, String> {
+    let mut transfers = TRANSFERS.lock();
+    let state = transfers.get_mut(&transfer_id)
+        .ok_or_else(|| format!("Transfer not found: {}", transfer_id))?;
+    
+    // Decode chunk data
+    let chunk_data = general_purpose::STANDARD.decode(&data)
+        .map_err(|e| format!("Base64 decode error: {}", e))?;
+    
+    // Write chunk to temp file
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&state.temp_path)
+        .map_err(|e| e.to_string())?;
+    
+    let offset = chunk_index as u64 * CHUNK_SIZE as u64;
+    file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    file.write_all(&chunk_data).map_err(|e| e.to_string())?;
+    
+    state.received_chunks = chunk_index + 1;
+    
+    let progress = (state.received_chunks as f64 / state.total_chunks as f64 * 100.0) as u32;
+    
+    let _ = app.emit("file-transfer-progress", serde_json::json!({
+        "transfer_id": transfer_id,
+        "chunk_index": chunk_index,
+        "received": state.received_chunks,
+        "total": state.total_chunks,
+        "progress": progress
+    }));
+    
+    Ok(serde_json::json!({
+        "chunk_index": chunk_index,
+        "received": state.received_chunks,
+        "progress": progress
+    }))
+}
+
+// Client: Finalize transfer - verify and rename
+#[tauri::command]
+fn finalize_file_transfer(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    save_dir: String
+) -> Result<serde_json::Value, String> {
+    let mut transfers = TRANSFERS.lock();
+    let state = transfers.get_mut(&transfer_id)
+        .ok_or_else(|| format!("Transfer not found: {}", transfer_id))?;
+    
+    // Verify file hash
+    let mut file = File::open(&state.temp_path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    
+    loop {
+        let bytes_read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if bytes_read == 0 { break; }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    
+    let computed_hash = hex::encode(hasher.finalize());
+    
+    if computed_hash != state.file_hash {
+        return Err(format!("Hash mismatch! Expected: {}, Got: {}", state.file_hash, computed_hash));
+    }
+    
+    // Rename temp file to final name
+    let final_path = PathBuf::from(&save_dir).join(&state.file_name);
+    fs::rename(&state.temp_path, &final_path).map_err(|e| e.to_string())?;
+    
+    state.completed = true;
+    
+    let _ = app.emit("file-transfer-complete", serde_json::json!({
+        "transfer_id": transfer_id,
+        "file_name": state.file_name,
+        "file_path": final_path.to_string_lossy(),
+        "file_size": state.file_size
+    }));
+    
+    // Cleanup
+    transfers.remove(&transfer_id);
+    
+    Ok(serde_json::json!({
+        "status": "complete",
+        "file_path": final_path.to_string_lossy()
+    }))
+}
+
+// Client: Get transfer status (for resume)
+#[tauri::command]
+fn get_transfer_status(transfer_id: String) -> Result<serde_json::Value, String> {
+    let transfers = TRANSFERS.lock();
+    
+    if let Some(state) = transfers.get(&transfer_id) {
+        Ok(serde_json::json!({
+            "found": true,
+            "received_chunks": state.received_chunks,
+            "total_chunks": state.total_chunks,
+            "completed": state.completed
+        }))
+    } else {
+        Ok(serde_json::json!({
+            "found": false
+        }))
+    }
+}
+
+// Client: Cancel and cleanup transfer
+#[tauri::command]
+fn cancel_file_transfer(transfer_id: String) -> Result<(), String> {
+    let mut transfers = TRANSFERS.lock();
+    
+    if let Some(state) = transfers.remove(&transfer_id) {
+        // Delete temp file
+        let _ = fs::remove_file(&state.temp_path);
+    }
+    
+    Ok(())
+}
+
+// ============== Direct TCP File Transfer ==============
+use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::io::{BufReader, BufWriter};
+
+const TCP_FILE_PORT: u16 = 3003;
+const TCP_CHUNK_SIZE: usize = 256 * 1024; // 256KB for TCP (larger than UDP)
+
+lazy_static::lazy_static! {
+    static ref TCP_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
+    static ref TCP_TRANSFER_ACTIVE: AtomicBool = AtomicBool::new(false);
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TcpTransferProgress {
+    transfer_id: String,
+    bytes_transferred: u64,
+    total_bytes: u64,
+    progress: u32,
+}
+
+// Client: Start TCP server to receive file
+#[tauri::command]
+fn start_tcp_file_server(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    file_name: String,
+    file_size: u64,
+    file_hash: String,
+    save_dir: String
+) -> Result<u16, String> {
+    if TCP_SERVER_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("TCP server already running".to_string());
+    }
+    
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", TCP_FILE_PORT))
+        .map_err(|e| {
+            TCP_SERVER_RUNNING.store(false, Ordering::SeqCst);
+            format!("Cannot bind TCP port {}: {}", TCP_FILE_PORT, e)
+        })?;
+    
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(TCP_FILE_PORT);
+    
+    println!("TCP file server started on port {}", port);
+    
+    thread::spawn(move || {
+        // Set timeout for accept
+        let _ = listener.set_nonblocking(false);
+        
+        // Wait for connection (timeout 60s)
+        let accept_result = listener.accept();
+        
+        match accept_result {
+            Ok((stream, addr)) => {
+                println!("TCP connection from: {}", addr);
+                
+                if let Err(e) = receive_file_via_tcp(
+                    &app,
+                    stream,
+                    &transfer_id,
+                    &file_name,
+                    file_size,
+                    &file_hash,
+                    &save_dir
+                ) {
+                    eprintln!("TCP receive error: {}", e);
+                    let _ = app.emit("tcp-transfer-error", serde_json::json!({
+                        "transfer_id": transfer_id,
+                        "error": e
+                    }));
+                }
+            }
+            Err(e) => {
+                eprintln!("TCP accept error: {}", e);
+                let _ = app.emit("tcp-transfer-error", serde_json::json!({
+                    "transfer_id": transfer_id,
+                    "error": format!("Accept failed: {}", e)
+                }));
+            }
+        }
+        
+        TCP_SERVER_RUNNING.store(false, Ordering::SeqCst);
+        println!("TCP file server stopped");
+    });
+    
+    Ok(port)
+}
+
+fn receive_file_via_tcp(
+    app: &tauri::AppHandle,
+    stream: TcpStream,
+    transfer_id: &str,
+    file_name: &str,
+    file_size: u64,
+    expected_hash: &str,
+    save_dir: &str
+) -> Result<(), String> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    
+    let save_path = PathBuf::from(save_dir);
+    let temp_path = save_path.join(format!("{}.tmp", transfer_id));
+    let final_path = save_path.join(file_name);
+    
+    // Check for resume
+    let resume_offset = if temp_path.exists() {
+        fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    
+    // Open file for writing (append if resuming)
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resume_offset > 0)
+        .open(&temp_path)
+        .map_err(|e| format!("Cannot create temp file: {}", e))?;
+    
+    if resume_offset == 0 {
+        file.set_len(0).map_err(|e| e.to_string())?;
+    }
+    
+    let mut reader = BufReader::with_capacity(TCP_CHUNK_SIZE, stream);
+    let mut buffer = vec![0u8; TCP_CHUNK_SIZE];
+    let mut bytes_received = resume_offset;
+    let mut last_progress = 0u32;
+    
+    // Send resume offset to sender
+    // (Protocol: first 8 bytes from client = resume offset)
+    // Actually, we receive data, so we need to tell sender where to start
+    // This is handled by signaling via Socket.IO
+    
+    println!("Receiving file: {} ({} bytes, resume from {})", file_name, file_size, resume_offset);
+    
+    while bytes_received < file_size {
+        let to_read = std::cmp::min(TCP_CHUNK_SIZE, (file_size - bytes_received) as usize);
+        
+        match reader.read(&mut buffer[..to_read]) {
+            Ok(0) => {
+                // Connection closed
+                if bytes_received < file_size {
+                    return Err(format!("Connection closed early: {}/{} bytes", bytes_received, file_size));
+                }
+                break;
+            }
+            Ok(n) => {
+                file.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
+                bytes_received += n as u64;
+                
+                let progress = (bytes_received as f64 / file_size as f64 * 100.0) as u32;
+                
+                // Emit progress every 5%
+                if progress >= last_progress + 5 || bytes_received == file_size {
+                    let _ = app.emit("tcp-transfer-progress", TcpTransferProgress {
+                        transfer_id: transfer_id.to_string(),
+                        bytes_transferred: bytes_received,
+                        total_bytes: file_size,
+                        progress,
+                    });
+                    last_progress = progress;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || 
+                         e.kind() == std::io::ErrorKind::TimedOut => {
+                // Timeout - save progress and return error for resume
+                file.flush().map_err(|e| e.to_string())?;
+                return Err(format!("Timeout at {}/{} bytes - can resume", bytes_received, file_size));
+            }
+            Err(e) => {
+                file.flush().map_err(|e| e.to_string())?;
+                return Err(format!("Read error: {} at {}/{} bytes", e, bytes_received, file_size));
+            }
+        }
+    }
+    
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+    
+    // Verify hash
+    let mut verify_file = File::open(&temp_path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut verify_buf = vec![0u8; TCP_CHUNK_SIZE];
+    
+    loop {
+        let n = verify_file.read(&mut verify_buf).map_err(|e| e.to_string())?;
+        if n == 0 { break; }
+        hasher.update(&verify_buf[..n]);
+    }
+    
+    let computed_hash = hex::encode(hasher.finalize());
+    
+    if computed_hash != expected_hash {
+        return Err(format!("Hash mismatch! Expected: {}, Got: {}", expected_hash, computed_hash));
+    }
+    
+    // Rename to final path
+    fs::rename(&temp_path, &final_path).map_err(|e| e.to_string())?;
+    
+    let _ = app.emit("tcp-transfer-complete", serde_json::json!({
+        "transfer_id": transfer_id,
+        "file_name": file_name,
+        "file_path": final_path.to_string_lossy(),
+        "file_size": file_size
+    }));
+    
+    println!("File received successfully: {}", final_path.display());
+    
+    Ok(())
+}
+
+// Admin: Send file directly to client via TCP
+#[tauri::command]
+async fn send_file_tcp(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    file_path: String,
+    client_ip: String,
+    client_port: u16,
+    resume_offset: u64
+) -> Result<(), String> {
+    if TCP_TRANSFER_ACTIVE.swap(true, Ordering::SeqCst) {
+        return Err("Another TCP transfer is active".to_string());
+    }
+    
+    let app_clone = app.clone();
+    let transfer_id_clone = transfer_id.clone();
+    
+    thread::spawn(move || {
+        let result = send_file_via_tcp(
+            &app_clone,
+            &transfer_id_clone,
+            &file_path,
+            &client_ip,
+            client_port,
+            resume_offset
+        );
+        
+        if let Err(e) = result {
+            eprintln!("TCP send error: {}", e);
+            let _ = app_clone.emit("tcp-send-error", serde_json::json!({
+                "transfer_id": transfer_id_clone,
+                "error": e
+            }));
+        }
+        
+        TCP_TRANSFER_ACTIVE.store(false, Ordering::SeqCst);
+    });
+    
+    Ok(())
+}
+
+fn send_file_via_tcp(
+    app: &tauri::AppHandle,
+    transfer_id: &str,
+    file_path: &str,
+    client_ip: &str,
+    client_port: u16,
+    resume_offset: u64
+) -> Result<(), String> {
+    let addr = format!("{}:{}", client_ip, client_port);
+    
+    println!("Connecting to {} for file transfer...", addr);
+    
+    let stream = TcpStream::connect_timeout(
+        &addr.parse::<SocketAddr>().map_err(|e| e.to_string())?,
+        Duration::from_secs(10)
+    ).map_err(|e| format!("Cannot connect to {}: {}", addr, e))?;
+    
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_nodelay(true); // Disable Nagle for better throughput
+    
+    let mut file = File::open(file_path).map_err(|e| e.to_string())?;
+    let file_size = file.metadata().map_err(|e| e.to_string())?.len();
+    
+    // Seek to resume position
+    if resume_offset > 0 {
+        file.seek(SeekFrom::Start(resume_offset)).map_err(|e| e.to_string())?;
+        println!("Resuming from offset: {}", resume_offset);
+    }
+    
+    let mut writer = BufWriter::with_capacity(TCP_CHUNK_SIZE, stream);
+    let mut buffer = vec![0u8; TCP_CHUNK_SIZE];
+    let mut bytes_sent = resume_offset;
+    let mut last_progress = 0u32;
+    
+    println!("Sending file: {} ({} bytes)", file_path, file_size);
+    
+    while bytes_sent < file_size {
+        let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if n == 0 { break; }
+        
+        writer.write_all(&buffer[..n]).map_err(|e| format!("Write error: {}", e))?;
+        bytes_sent += n as u64;
+        
+        let progress = (bytes_sent as f64 / file_size as f64 * 100.0) as u32;
+        
+        // Emit progress every 5%
+        if progress >= last_progress + 5 || bytes_sent == file_size {
+            let _ = app.emit("tcp-send-progress", TcpTransferProgress {
+                transfer_id: transfer_id.to_string(),
+                bytes_transferred: bytes_sent,
+                total_bytes: file_size,
+                progress,
+            });
+            last_progress = progress;
+        }
+    }
+    
+    writer.flush().map_err(|e| e.to_string())?;
+    
+    let _ = app.emit("tcp-send-complete", serde_json::json!({
+        "transfer_id": transfer_id,
+        "bytes_sent": bytes_sent
+    }));
+    
+    println!("File sent successfully: {} bytes", bytes_sent);
+    
+    Ok(())
+}
+
+// Stop TCP server (for cleanup)
+#[tauri::command]
+fn stop_tcp_file_server() {
+    TCP_SERVER_RUNNING.store(false, Ordering::SeqCst);
+}
+
+// Get TCP transfer status
+#[tauri::command]
+fn get_tcp_transfer_status() -> serde_json::Value {
+    serde_json::json!({
+        "server_running": TCP_SERVER_RUNNING.load(Ordering::SeqCst),
+        "transfer_active": TCP_TRANSFER_ACTIVE.load(Ordering::SeqCst)
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             capture_screen,
             start_capture_loop,
@@ -821,7 +1433,20 @@ pub fn run() {
             remote_key_press,
             scan_lan,
             wake_on_lan,
-            get_network_info
+            get_network_info,
+            // File transfer (Socket.IO)
+            prepare_file_transfer,
+            read_file_chunk,
+            init_file_receive,
+            receive_file_chunk,
+            finalize_file_transfer,
+            get_transfer_status,
+            cancel_file_transfer,
+            // Direct TCP file transfer
+            start_tcp_file_server,
+            send_file_tcp,
+            stop_tcp_file_server,
+            get_tcp_transfer_status
         ])
         .setup(|_app| {
             #[cfg(debug_assertions)]
