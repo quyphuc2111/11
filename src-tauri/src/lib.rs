@@ -1,258 +1,451 @@
 use base64::{engine::general_purpose, Engine};
+use openh264::encoder::{Encoder, EncoderConfig, BitRate, FrameRate};
+use openh264::formats::YUVBuffer;
 use parking_lot::Mutex;
 use rdev::{simulate, Button, EventType, Key, SimulateError};
 use scrap::{Capturer, Display};
-use std::io::Cursor;
 use std::io::ErrorKind::WouldBlock;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 use std::thread;
 use tauri::{Emitter, Manager};
-use tokio::sync::broadcast;
+
+// ============== Constants ==============
+const STREAM_WIDTH: usize = 640;
+const STREAM_HEIGHT: usize = 360;
 
 // ============== Global State ==============
 lazy_static::lazy_static! {
     static ref CAPTURING: AtomicBool = AtomicBool::new(false);
     static ref STREAMING: AtomicBool = AtomicBool::new(false);
     static ref UDP_RECEIVER_RUNNING: AtomicBool = AtomicBool::new(false);
-    static ref FRAME_SENDER: Mutex<Option<broadcast::Sender<Vec<u8>>>> = Mutex::new(None);
+    static ref FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
+    static ref LAST_H264_FRAME: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+    static ref LAST_JPEG_FRAME: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 }
 
-// ============== Screen Capture with scrap ==============
+// ============== Screen Capture ==============
+struct ScreenCapturer {
+    capturer: Capturer,
+    width: usize,
+    height: usize,
+}
 
-fn capture_frame_bgra() -> Result<(Vec<u8>, usize, usize), String> {
-    let display = Display::primary().map_err(|e| format!("No display: {}", e))?;
-    let mut capturer = Capturer::new(display).map_err(|e| format!("Capturer error: {}", e))?;
-    
-    let width = capturer.width();
-    let height = capturer.height();
-    
-    // Try to get a frame (may need multiple attempts)
-    for _ in 0..10 {
-        match capturer.frame() {
-            Ok(frame) => {
-                return Ok((frame.to_vec(), width, height));
-            }
-            Err(ref e) if e.kind() == WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(e) => return Err(format!("Frame error: {}", e)),
+impl ScreenCapturer {
+    fn new() -> Result<Self, String> {
+        let display = Display::primary().map_err(|e| format!("No display: {}", e))?;
+        let width = display.width();
+        let height = display.height();
+        let capturer = Capturer::new(display).map_err(|e| format!("Capturer error: {}", e))?;
+        Ok(Self { capturer, width, height })
+    }
+
+    fn capture(&mut self) -> Option<Vec<u8>> {
+        match self.capturer.frame() {
+            Ok(frame) => Some(frame.to_vec()),
+            Err(ref e) if e.kind() == WouldBlock => None,
+            Err(_) => None,
         }
     }
-    Err("Timeout waiting for frame".to_string())
 }
 
-fn bgra_to_jpeg(bgra: &[u8], width: usize, height: usize, quality: u8) -> Result<Vec<u8>, String> {
-    // Convert BGRA to RGB
-    let mut rgb = Vec::with_capacity(width * height * 3);
-    let stride = bgra.len() / height;
+// ============== H.264 Encoder ==============
+struct H264Encoder {
+    encoder: Encoder,
+    width: usize,
+    height: usize,
+    frame_count: u32,
+}
+
+impl H264Encoder {
+    fn new(width: usize, height: usize) -> Result<Self, String> {
+        let config = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(500_000)) // 500 kbps
+            .max_frame_rate(FrameRate::from_hz(30.0));
+        
+        let encoder = Encoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            config
+        ).map_err(|e| format!("H264 encoder error: {:?}", e))?;
+        
+        Ok(Self {
+            encoder,
+            width,
+            height,
+            frame_count: 0,
+        })
+    }
+
+    fn encode(&mut self, bgra: &[u8], src_width: usize, src_height: usize) -> Option<Vec<u8>> {
+        // Resize and convert BGRA to YUV420
+        let yuv = bgra_to_yuv420_resized(bgra, src_width, src_height, self.width, self.height)?;
+        
+        let yuv_buf = YUVBuffer::from_vec(yuv, self.width, self.height);
+        
+        // Encode to H.264
+        let bitstream = self.encoder.encode(&yuv_buf).ok()?;
+        
+        // Get raw H.264 data
+        let h264_data = bitstream.to_vec();
+        
+        self.frame_count += 1;
+        
+        if !h264_data.is_empty() {
+            Some(h264_data)
+        } else {
+            None
+        }
+    }
+}
+
+// BGRA to YUV420 with resize
+fn bgra_to_yuv420_resized(
+    bgra: &[u8], 
+    src_w: usize, 
+    src_h: usize, 
+    dst_w: usize, 
+    dst_h: usize
+) -> Option<Vec<u8>> {
+    let stride = bgra.len() / src_h;
+    let scale_x = src_w as f32 / dst_w as f32;
+    let scale_y = src_h as f32 / dst_h as f32;
     
-    for y in 0..height {
-        for x in 0..width {
-            let i = y * stride + x * 4;
+    let y_size = dst_w * dst_h;
+    let uv_size = (dst_w / 2) * (dst_h / 2);
+    let mut yuv = vec![0u8; y_size + uv_size * 2];
+    
+    let (y_plane, uv_planes) = yuv.split_at_mut(y_size);
+    let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
+    
+    // Convert to Y plane
+    for y in 0..dst_h {
+        let src_y = (y as f32 * scale_y) as usize;
+        for x in 0..dst_w {
+            let src_x = (x as f32 * scale_x) as usize;
+            let i = src_y * stride + src_x * 4;
+            
+            if i + 2 < bgra.len() {
+                let b = bgra[i] as i32;
+                let g = bgra[i + 1] as i32;
+                let r = bgra[i + 2] as i32;
+                
+                // RGB to Y
+                let y_val = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                y_plane[y * dst_w + x] = y_val.clamp(0, 255) as u8;
+            }
+        }
+    }
+    
+    // Convert to U and V planes (subsampled 2x2)
+    for y in 0..(dst_h / 2) {
+        let src_y = ((y * 2) as f32 * scale_y) as usize;
+        for x in 0..(dst_w / 2) {
+            let src_x = ((x * 2) as f32 * scale_x) as usize;
+            let i = src_y * stride + src_x * 4;
+            
+            if i + 2 < bgra.len() {
+                let b = bgra[i] as i32;
+                let g = bgra[i + 1] as i32;
+                let r = bgra[i + 2] as i32;
+                
+                // RGB to U, V
+                let u_val = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                let v_val = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                
+                let uv_idx = y * (dst_w / 2) + x;
+                u_plane[uv_idx] = u_val.clamp(0, 255) as u8;
+                v_plane[uv_idx] = v_val.clamp(0, 255) as u8;
+            }
+        }
+    }
+    
+    Some(yuv)
+}
+
+// JPEG encoding for fallback/preview
+fn encode_jpeg(bgra: &[u8], src_w: usize, src_h: usize, quality: u8) -> Option<Vec<u8>> {
+    let stride = bgra.len() / src_h;
+    let dst_w = STREAM_WIDTH;
+    let dst_h = STREAM_HEIGHT;
+    let scale_x = src_w as f32 / dst_w as f32;
+    let scale_y = src_h as f32 / dst_h as f32;
+    
+    let mut rgb = Vec::with_capacity(dst_w * dst_h * 3);
+    
+    for y in 0..dst_h {
+        let src_y = (y as f32 * scale_y) as usize;
+        for x in 0..dst_w {
+            let src_x = (x as f32 * scale_x) as usize;
+            let i = src_y * stride + src_x * 4;
             if i + 2 < bgra.len() {
                 rgb.push(bgra[i + 2]); // R
                 rgb.push(bgra[i + 1]); // G
                 rgb.push(bgra[i]);     // B
+            } else {
+                rgb.extend_from_slice(&[0, 0, 0]);
             }
         }
     }
     
-    // Create RGB image and resize
-    let img = image::RgbImage::from_raw(width as u32, height as u32, rgb)
-        .ok_or("Failed to create image")?;
-    
-    // Resize to 640px width for bandwidth
-    let target_width = 640u32;
-    let target_height = (target_width as f32 * height as f32 / width as f32) as u32;
-    let resized = image::imageops::resize(&img, target_width, target_height, image::imageops::FilterType::Nearest);
-    
-    // Encode to JPEG
-    let mut buffer = Cursor::new(Vec::new());
-    resized.write_to(&mut buffer, image::ImageOutputFormat::Jpeg(quality))
-        .map_err(|e| format!("JPEG encode error: {}", e))?;
-    
-    Ok(buffer.into_inner())
+    let img = image::RgbImage::from_raw(dst_w as u32, dst_h as u32, rgb)?;
+    let mut buffer = std::io::Cursor::new(Vec::with_capacity(50000));
+    img.write_to(&mut buffer, image::ImageOutputFormat::Jpeg(quality)).ok()?;
+    Some(buffer.into_inner())
 }
 
-// ============== UDP Streaming ==============
 
-/// Start UDP streaming to server
-fn start_udp_stream(server_addr: &str, fps: u32) -> Result<(), String> {
-    if STREAMING.load(Ordering::SeqCst) {
+// ============== H.264 UDP Streaming ==============
+fn start_h264_streaming(server_addr: String, fps: u32) -> Result<(), String> {
+    if STREAMING.swap(true, Ordering::SeqCst) {
         return Err("Already streaming".to_string());
     }
     
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    socket.set_nonblocking(false).map_err(|e| e.to_string())?;
-    
-    let server = server_addr.to_string();
-    let interval = Duration::from_millis(1000 / fps as u64);
-    
-    STREAMING.store(true, Ordering::SeqCst);
-    
     thread::spawn(move || {
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("UDP bind error: {}", e);
+                STREAMING.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        
+        let mut capturer = match ScreenCapturer::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Capturer error: {}", e);
+                STREAMING.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        
+        let mut encoder = match H264Encoder::new(STREAM_WIDTH, STREAM_HEIGHT) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("H264 encoder error: {}", e);
+                STREAMING.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        
+        let frame_interval = Duration::from_micros(1_000_000 / fps as u64);
         let mut sequence: u32 = 0;
+        let mut last_frame_time = Instant::now();
+        
+        println!("H.264 UDP streaming started to {} at {} FPS ({}x{})", 
+                 server_addr, fps, STREAM_WIDTH, STREAM_HEIGHT);
         
         while STREAMING.load(Ordering::SeqCst) {
-            match capture_frame_bgra() {
-                Ok((bgra, width, height)) => {
-                    if let Ok(jpeg) = bgra_to_jpeg(&bgra, width, height, 50) {
-                        // Send frame via UDP with chunking
-                        let _ = send_udp_frame(&socket, &server, &jpeg, sequence);
+            let now = Instant::now();
+            
+            if let Some(bgra) = capturer.capture() {
+                // Encode to H.264
+                if let Some(h264_data) = encoder.encode(&bgra, capturer.width, capturer.height) {
+                    // Send via UDP with H264 magic header
+                    if send_h264_udp(&socket, &server_addr, &h264_data, sequence).is_ok() {
                         sequence = sequence.wrapping_add(1);
+                        FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    
+                    *LAST_H264_FRAME.lock() = Some(h264_data);
+                }
+                
+                // Also encode JPEG for preview/fallback
+                if let Some(jpeg) = encode_jpeg(&bgra, capturer.width, capturer.height, 60) {
+                    *LAST_JPEG_FRAME.lock() = Some(jpeg);
+                }
+                
+                let elapsed = now.elapsed();
+                if elapsed < frame_interval {
+                    thread::sleep(frame_interval - elapsed);
+                }
+                last_frame_time = Instant::now();
+            } else {
+                thread::sleep(Duration::from_millis(1));
+                
+                if last_frame_time.elapsed() > Duration::from_secs(2) {
+                    if let Ok(new_capturer) = ScreenCapturer::new() {
+                        capturer = new_capturer;
+                        last_frame_time = Instant::now();
                     }
                 }
-                Err(_) => {}
             }
-            thread::sleep(interval);
         }
+        
+        println!("H.264 streaming stopped");
     });
     
     Ok(())
 }
 
-fn send_udp_frame(socket: &UdpSocket, addr: &str, data: &[u8], sequence: u32) -> Result<(), String> {
-    const MAX_CHUNK: usize = 1400;
+fn send_h264_udp(socket: &UdpSocket, addr: &str, data: &[u8], sequence: u32) -> Result<(), String> {
+    const MAX_PAYLOAD: usize = 1400;
+    const HEADER_SIZE: usize = 12;
     
-    let chunks: Vec<&[u8]> = data.chunks(MAX_CHUNK - 12).collect();
-    let total = chunks.len() as u16;
+    let chunk_size = MAX_PAYLOAD - HEADER_SIZE;
+    let total_chunks = (data.len() + chunk_size - 1) / chunk_size;
     
-    for (i, chunk) in chunks.iter().enumerate() {
-        let mut packet = Vec::with_capacity(chunk.len() + 12);
-        // Header: magic(2) + seq(4) + idx(2) + total(2) + len(2)
-        packet.extend_from_slice(b"SC"); // Magic bytes
-        packet.extend_from_slice(&sequence.to_be_bytes());
-        packet.extend_from_slice(&(i as u16).to_be_bytes());
-        packet.extend_from_slice(&total.to_be_bytes());
-        packet.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+    for (i, chunk) in data.chunks(chunk_size).enumerate() {
+        let mut packet = Vec::with_capacity(HEADER_SIZE + chunk.len());
+        
+        // Header: magic(2) + type(1) + flags(1) + seq(4) + idx(2) + total(2)
+        packet.extend_from_slice(b"H4");  // H.264 magic
+        packet.push(if i == 0 { 0x01 } else { 0x00 }); // type: 1=keyframe start
+        packet.push(0x00); // flags reserved
+        packet.extend_from_slice(&sequence.to_le_bytes());
+        packet.extend_from_slice(&(i as u16).to_le_bytes());
+        packet.extend_from_slice(&(total_chunks as u16).to_le_bytes());
         packet.extend_from_slice(chunk);
         
-        socket.send_to(&packet, addr).map_err(|e| e.to_string())?;
+        if socket.send_to(&packet, addr).is_err() {
+            return Err("Send failed".to_string());
+        }
     }
     
     Ok(())
 }
 
-// ============== TCP Server for Admin ==============
 
-/// Start TCP server to receive and broadcast frames
-fn start_frame_server(port: u16) -> Result<broadcast::Receiver<Vec<u8>>, String> {
-    let (tx, rx) = broadcast::channel::<Vec<u8>>(16);
-    
-    {
-        let mut sender = FRAME_SENDER.lock();
-        *sender = Some(tx.clone());
+// ============== H.264 UDP Receiver ==============
+fn start_h264_receiver(app: tauri::AppHandle, port: u16) -> Result<(), String> {
+    if UDP_RECEIVER_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("Already running".to_string());
     }
     
-    // Start UDP receiver
-    if !UDP_RECEIVER_RUNNING.load(Ordering::SeqCst) {
-        UDP_RECEIVER_RUNNING.store(true, Ordering::SeqCst);
+    thread::spawn(move || {
+        let socket = match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("UDP bind error on port {}: {}", port, e);
+                UDP_RECEIVER_RUNNING.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
         
-        let udp_port = port;
-        thread::spawn(move || {
-            let socket = match UdpSocket::bind(format!("0.0.0.0:{}", udp_port)) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("UDP bind error: {}", e);
-                    UDP_RECEIVER_RUNNING.store(false, Ordering::SeqCst);
-                    return;
-                }
-            };
-            
-            let mut frame_buffers: std::collections::HashMap<u32, FrameBuffer> = std::collections::HashMap::new();
-            let mut buf = [0u8; 1500];
-            
-            while UDP_RECEIVER_RUNNING.load(Ordering::SeqCst) {
-                match socket.recv_from(&mut buf) {
-                    Ok((len, _addr)) => {
-                        if len < 12 || &buf[0..2] != b"SC" {
-                            continue;
-                        }
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+        
+        let mut frame_buffer = H264FrameAssembler::new();
+        let mut buf = [0u8; 1500];
+        let mut last_emit = Instant::now();
+        let emit_interval = Duration::from_millis(33);
+        
+        println!("H.264 UDP receiver started on port {}", port);
+        
+        while UDP_RECEIVER_RUNNING.load(Ordering::SeqCst) {
+            match socket.recv_from(&mut buf) {
+                Ok((len, addr)) => {
+                    if len < 12 {
+                        continue;
+                    }
+                    
+                    // Check magic header
+                    if &buf[0..2] == b"H4" {
+                        // H.264 frame
+                        let _frame_type = buf[2];
+                        let seq = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                        let idx = u16::from_le_bytes([buf[8], buf[9]]) as usize;
+                        let total = u16::from_le_bytes([buf[10], buf[11]]) as usize;
+                        let payload = &buf[12..len];
                         
-                        let seq = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
-                        let idx = u16::from_be_bytes([buf[6], buf[7]]) as usize;
-                        let total = u16::from_be_bytes([buf[8], buf[9]]) as usize;
-                        let chunk_len = u16::from_be_bytes([buf[10], buf[11]]) as usize;
-                        
-                        if 12 + chunk_len > len {
-                            continue;
-                        }
-                        
-                        let chunk = &buf[12..12 + chunk_len];
-                        
-                        let fb = frame_buffers.entry(seq).or_insert_with(|| FrameBuffer::new(total));
-                        
-                        if fb.add_chunk(idx, chunk) {
-                            if let Some(frame) = fb.complete() {
-                                if let Some(sender) = FRAME_SENDER.lock().as_ref() {
-                                    let _ = sender.send(frame);
-                                }
+                        if let Some(h264_frame) = frame_buffer.add_chunk(seq, idx, total, payload) {
+                            if last_emit.elapsed() >= emit_interval {
+                                let base64_str = general_purpose::STANDARD.encode(&h264_frame);
+                                let _ = app.emit("h264-frame", (&addr.ip().to_string(), base64_str));
+                                last_emit = Instant::now();
                             }
-                            frame_buffers.remove(&seq);
-                            
-                            // Clean old buffers
-                            frame_buffers.retain(|&k, _| k > seq.saturating_sub(10));
+                        }
+                    } else if &buf[0..2] == b"SF" {
+                        // Legacy JPEG frame (backward compatible)
+                        let seq = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
+                        let idx = u16::from_le_bytes([buf[6], buf[7]]) as usize;
+                        let total = u16::from_le_bytes([buf[8], buf[9]]) as usize;
+                        let payload = &buf[10..len];
+                        
+                        if let Some(jpeg_frame) = frame_buffer.add_chunk(seq, idx, total, payload) {
+                            if last_emit.elapsed() >= emit_interval {
+                                let base64_str = general_purpose::STANDARD.encode(&jpeg_frame);
+                                let data_url = format!("data:image/jpeg;base64,{}", base64_str);
+                                let _ = app.emit("udp-frame", (&addr.ip().to_string(), data_url));
+                                last_emit = Instant::now();
+                            }
                         }
                     }
-                    Err(_) => {}
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || 
+                             e.kind() == std::io::ErrorKind::TimedOut => {
+                    continue;
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(10));
                 }
             }
-        });
-    }
+        }
+        
+        println!("H.264 receiver stopped");
+    });
     
-    Ok(rx)
+    Ok(())
 }
 
-struct FrameBuffer {
+struct H264FrameAssembler {
+    current_seq: u32,
     chunks: Vec<Option<Vec<u8>>>,
-    received: usize,
     total: usize,
+    received: usize,
 }
 
-impl FrameBuffer {
-    fn new(total: usize) -> Self {
+impl H264FrameAssembler {
+    fn new() -> Self {
         Self {
-            chunks: vec![None; total],
+            current_seq: u32::MAX,
+            chunks: Vec::new(),
+            total: 0,
             received: 0,
-            total,
         }
     }
     
-    fn add_chunk(&mut self, idx: usize, data: &[u8]) -> bool {
+    fn add_chunk(&mut self, seq: u32, idx: usize, total: usize, data: &[u8]) -> Option<Vec<u8>> {
+        if seq != self.current_seq {
+            self.current_seq = seq;
+            self.chunks = vec![None; total];
+            self.total = total;
+            self.received = 0;
+        }
+        
         if idx < self.total && self.chunks[idx].is_none() {
             self.chunks[idx] = Some(data.to_vec());
             self.received += 1;
         }
-        self.received == self.total
-    }
-    
-    fn complete(&self) -> Option<Vec<u8>> {
-        if self.received != self.total {
-            return None;
+        
+        if self.received == self.total {
+            let mut result = Vec::with_capacity(self.total * 1400);
+            for chunk in &self.chunks {
+                if let Some(data) = chunk {
+                    result.extend_from_slice(data);
+                }
+            }
+            
+            self.current_seq = u32::MAX;
+            self.chunks.clear();
+            self.received = 0;
+            
+            return Some(result);
         }
         
-        let mut result = Vec::new();
-        for chunk in &self.chunks {
-            if let Some(data) = chunk {
-                result.extend_from_slice(data);
-            }
-        }
-        Some(result)
+        None
     }
 }
 
-// ============== Input Simulation ==============
 
+// ============== Input Simulation ==============
 fn send_event(event_type: &EventType) -> Result<(), String> {
     match simulate(event_type) {
         Ok(()) => {
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(5));
             Ok(())
         }
-        Err(SimulateError) => Err(format!("Failed to simulate: {:?}", event_type)),
+        Err(SimulateError) => Err(format!("Failed: {:?}", event_type)),
     }
 }
 
@@ -291,28 +484,60 @@ fn js_key_to_rdev(key: &str, code: &str) -> Option<Key> {
 }
 
 // ============== Tauri Commands ==============
-
 #[tauri::command]
 fn capture_screen() -> Result<String, String> {
-    let (bgra, width, height) = capture_frame_bgra()?;
-    let jpeg = bgra_to_jpeg(&bgra, width, height, 50)?;
-    let base64_str = general_purpose::STANDARD.encode(&jpeg);
-    Ok(format!("data:image/jpeg;base64,{}", base64_str))
+    if let Some(jpeg) = LAST_JPEG_FRAME.lock().clone() {
+        let base64_str = general_purpose::STANDARD.encode(&jpeg);
+        return Ok(format!("data:image/jpeg;base64,{}", base64_str));
+    }
+    
+    let mut capturer = ScreenCapturer::new()?;
+    
+    for _ in 0..30 {
+        if let Some(bgra) = capturer.capture() {
+            if let Some(jpeg) = encode_jpeg(&bgra, capturer.width, capturer.height, 60) {
+                let base64_str = general_purpose::STANDARD.encode(&jpeg);
+                return Ok(format!("data:image/jpeg;base64,{}", base64_str));
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    
+    Err("Capture timeout".to_string())
 }
 
 #[tauri::command]
 fn start_capture_loop(app: tauri::AppHandle, interval_ms: u64) {
-    if CAPTURING.load(Ordering::SeqCst) {
+    if CAPTURING.swap(true, Ordering::SeqCst) {
         return;
     }
-    CAPTURING.store(true, Ordering::SeqCst);
     
     thread::spawn(move || {
-        while CAPTURING.load(Ordering::SeqCst) {
-            if let Ok(data) = capture_screen() {
-                let _ = app.emit("screen-frame", data);
+        let mut capturer = match ScreenCapturer::new() {
+            Ok(c) => c,
+            Err(_) => {
+                CAPTURING.store(false, Ordering::SeqCst);
+                return;
             }
-            thread::sleep(Duration::from_millis(interval_ms));
+        };
+        
+        let interval = Duration::from_millis(interval_ms);
+        
+        while CAPTURING.load(Ordering::SeqCst) {
+            let start = Instant::now();
+            
+            if let Some(bgra) = capturer.capture() {
+                if let Some(jpeg) = encode_jpeg(&bgra, capturer.width, capturer.height, 60) {
+                    let base64_str = general_purpose::STANDARD.encode(&jpeg);
+                    let data_url = format!("data:image/jpeg;base64,{}", base64_str);
+                    let _ = app.emit("screen-frame", data_url);
+                }
+            }
+            
+            let elapsed = start.elapsed();
+            if elapsed < interval {
+                thread::sleep(interval - elapsed);
+            }
         }
     });
 }
@@ -322,10 +547,9 @@ fn stop_capture_loop() {
     CAPTURING.store(false, Ordering::SeqCst);
 }
 
-/// Start UDP streaming to server (for client)
 #[tauri::command]
 fn start_stream(server_addr: String, fps: u32) -> Result<(), String> {
-    start_udp_stream(&server_addr, fps)
+    start_h264_streaming(server_addr, fps)
 }
 
 #[tauri::command]
@@ -333,27 +557,9 @@ fn stop_stream() {
     STREAMING.store(false, Ordering::SeqCst);
 }
 
-/// Start frame receiver server (for admin)
 #[tauri::command]
 fn start_frame_receiver(app: tauri::AppHandle, port: u16) -> Result<(), String> {
-    let mut rx = start_frame_server(port)?;
-    
-    thread::spawn(move || {
-        loop {
-            match rx.blocking_recv() {
-                Ok(frame) => {
-                    let base64_str = general_purpose::STANDARD.encode(&frame);
-                    let data_url = format!("data:image/jpeg;base64,{}", base64_str);
-                    let _ = app.emit("udp-frame", data_url);
-                }
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
-    });
-    
-    Ok(())
+    start_h264_receiver(app, port)
 }
 
 #[tauri::command]
@@ -362,14 +568,20 @@ fn stop_frame_receiver() {
 }
 
 #[tauri::command]
+fn get_stream_stats() -> serde_json::Value {
+    serde_json::json!({
+        "streaming": STREAMING.load(Ordering::SeqCst),
+        "capturing": CAPTURING.load(Ordering::SeqCst),
+        "frames_sent": FRAME_COUNT.load(Ordering::Relaxed),
+        "codec": "H.264",
+        "resolution": format!("{}x{}", STREAM_WIDTH, STREAM_HEIGHT)
+    })
+}
+
+#[tauri::command]
 fn get_screen_size() -> Result<serde_json::Value, String> {
-    match rdev::display_size() {
-        Ok((width, height)) => Ok(serde_json::json!({ "width": width, "height": height })),
-        Err(_) => {
-            let display = Display::primary().map_err(|e| e.to_string())?;
-            Ok(serde_json::json!({ "width": display.width(), "height": display.height() }))
-        }
-    }
+    let display = Display::primary().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "width": display.width(), "height": display.height() }))
 }
 
 #[tauri::command]
@@ -439,6 +651,7 @@ pub fn run() {
             stop_stream,
             start_frame_receiver,
             stop_frame_receiver,
+            get_stream_stats,
             get_screen_size,
             set_lock_screen,
             remote_mouse_move,

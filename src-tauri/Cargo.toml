@@ -39,3 +39,6 @@ tokio = { version = "1", features = ["full", "net", "io-util", "sync"] }
 lazy_static = "1.4"
 parking_lot = "0.12"
 
+# H.264 encoding
+openh264 = "0.7"
+
